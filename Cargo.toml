@@ -1,0 +1,63 @@
+[package]
+name = "enva"
+version = "0.1.0"
+edition = "2021"
+authors = ["Yanhua Zheng <zyh3084989256@gmail.com>"]
+description = "A lightweight micromamba environment manager for bioinformatics workflows"
+license = "MIT"
+repository = "https://github.com/Genomiclab/enva"
+
+[dependencies]
+# CLI and Argument Parsing
+clap = { version = "4.4", features = ["derive", "color"] }
+
+# Async Runtime
+tokio = { version = "1.30", features = ["full"] }
+
+# Async Traits
+async-trait = "0.1"
+
+# Error Handling
+thiserror = "1.0"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Progress Bars
+indicatif = "0.17"
+
+# Command execution
+which = "6.0"
+
+# Date and Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP client
+reqwest = { version = "0.10", features = ["json", "stream", "blocking", "rustls-tls"], default-features = false }
+
+# Additional utilities
+regex = "1.10"
+dirs = "5.0"
+
+[[bin]]
+name = "enva"
+path = "src/main.rs"
+
+[lib]
+name = "enva"
+path = "src/lib.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+debug = true
