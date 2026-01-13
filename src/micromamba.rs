@@ -1604,7 +1604,7 @@ dependencies:
     /// This function executes `conda env list` (or mamba/micromamba) and parses the output
     /// to return a list of all conda environments with their names and prefixes.
     pub async fn get_all_conda_environments(&self) -> Result<Vec<CondaEnvironment>> {
-        let cmd_name = match &self.pm {
+        let cmd_name = match &self.pm_type {
             PackageManager::Conda => "conda",
             PackageManager::Mamba => "mamba",
             PackageManager::Micromamba => "micromamba",
@@ -1620,11 +1620,11 @@ dependencies:
             .args(&["env", "list"])
             .output()
             .await
-            .map_err(|e| EnvError::PackageManagerNotFound(cmd_name.to_string()))?;
+            .map_err(|e| EnvError::Execution(format!("Failed to execute {}: {}", cmd_name, e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(EnvError::CommandFailed(format!(
+            return Err(EnvError::Execution(format!(
                 "Failed to list environments: {}",
                 stderr
             )));
