@@ -1,0 +1,39 @@
+name: xdxtools-core
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  # Core Python
+  - python=3.10.13
+  - numpy=1.24.4
+  - pandas
+
+  # QC Tools
+  - fastqc
+  - multiqc
+  - seqkit
+  - seqtk
+
+  # Methylation Analysis
+  - bismark
+  - trim-galore
+  - samtools>=1.7
+
+  # RNA-seq Analysis
+  - star
+  - htseq
+  - rmats
+
+  # General Bioinformatics
+  - picard
+
+  # ChIP-seq/ATAC-seq Core Tools
+  - macs2                 # Peak calling for ChIP-seq/ATAC-seq (使用默认版本以兼容 numpy 1.24)
+  - bwa=0.7.17            # Alignment for ChIP-seq
+  - bowtie2=2.5.4         # Alternative alignment for ChIP-seq
+  - phantompeakqualtools=1.2.1  # Cross-correlation analysis for ChIP-seq QC
+
+  # Visualization & Utilities
+  - matplotlib
+  - seaborn
+  - pyyaml
