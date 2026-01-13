@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **enva** is a lightweight, standalone micromamba environment manager designed for bioinformatics workflows. It's a Rust CLI tool that manages 4 pre-configured conda/micromamba environments for genomics and bioinformatics analysis. The project was extracted from xdxtools-rs with focus on minimalism and performance.
 
 **Key Metrics:**
-- Binary size: 4.9MB (90% smaller than xdxtools ~50MB)
-- Startup time: 0.17s (12-18x faster than xdxtools)
+- Binary size: 5.4MB (89% smaller than xdxtools ~50MB)
+- Startup time: ~0.2s (10-15x faster than xdxtools)
 - Memory usage: ~30MB (70% less than xdxtools)
 
 ## Build and Development Commands

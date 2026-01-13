@@ -1340,55 +1340,6 @@ Please remove the existing directory and try again, or use a different environme
         &self.environments
     }
 
-    /// Install R packages from GitHub using micromamba
-    pub async fn install_github_r_packages(&self) -> Result<()> {
-        use tokio::process::Command as AsyncCommand;
-
-        // Use lock to prevent race conditions during environment creation
-        let _lock = self.creation_lock.lock().await;
-
-        // Check if xdxtools-r environment exists
-        if !self.environment_exists("xdxtools-r").await? {
-            warn!("xdxtools-r environment does not exist, creating it first...");
-            let config_dir = std::env::current_dir().map_err(|e| {
-                EnvError::FileOperation(format!("Failed to get current directory: {}", e))
-            })?;
-            let yaml_file = config_dir.join("environments/configs/xdxtools-r.yaml");
-            self.create_environment(&yaml_file, false).await?;
-        }
-
-        info!("Installing R packages from GitHub using micromamba...");
-
-        // Get R executable path from the environment
-        let mut cmd = AsyncCommand::new(&self.pm_path);
-        cmd.arg("run")
-           .arg("-n")
-           .arg("xdxtools-r")
-           .arg("R")
-           .arg("--slave")
-           .arg("-e")
-           .arg("install.packages('remotes', repos='https://cloud.r-project.org'); library(devtools); install_github('genomiclab/xdxtools@main', upgrade='never')");
-
-        // Apply environment variables
-        self.apply_env_to_command(&mut cmd);
-
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| EnvError::Execution(format!("Failed to install R packages: {}", e)))?;
-
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            return Err(EnvError::Execution(format!(
-                "Failed to install R packages: {}",
-                error
-            )));
-        }
-
-        info!("Successfully installed R packages from GitHub");
-        Ok(())
-    }
-
     /// Install packages in environment
     pub async fn install_packages(&self, env_name: &str, packages: &[String]) -> Result<()> {
         use tokio::process::Command as AsyncCommand;
