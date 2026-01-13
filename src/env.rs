@@ -77,10 +77,6 @@ pub struct EnvValidateArgs {
 /// Environment list arguments
 #[derive(Debug, Clone, Args)]
 pub struct EnvListArgs {
-    /// Show all conda environments (not just enva-managed ones)
-    #[arg(short = 'a', long = "all", help = "Show all conda environments instead of just enva-managed ones")]
-    pub all: bool,
-
     /// Show detailed information
     #[arg(long)]
     pub detailed: bool,
@@ -369,109 +365,11 @@ async fn execute_env_create(
 }
 
 /// Execute environment list
-async fn execute_env_list(args: EnvListArgs, verbose: bool, json: bool) -> Result<()> {
+async fn execute_env_list(args: EnvListArgs, _verbose: bool, json: bool) -> Result<()> {
     info!("Listing conda environments...");
 
-    // If --all flag is used, show all conda environments
-    if args.all {
-        return list_all_conda_environments(json).await;
-    }
-
-    let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
-        error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution(
-            "Micromamba not found and auto-install failed.".to_string(),
-        )
-    })?;
-
-    let manager = micromamba_manager.lock().await;
-    let environments = manager.get_environment_statuses();
-
-    if environments.is_empty() {
-        if json {
-            println!("{{\"environments\": [], \"count\": 0}}");
-        } else {
-            info!("No conda environments configured");
-        }
-        return Ok(());
-    }
-
-    if json {
-        // Output JSON format
-        use serde_json::{json, Value};
-        let mut env_array = Vec::new();
-
-        for (name, env) in environments {
-            let status_str = match env.status {
-                crate::micromamba::EnvironmentStatus::Ready => "Ready",
-                crate::micromamba::EnvironmentStatus::Installed => "Installed",
-                crate::micromamba::EnvironmentStatus::NotInstalled => "Not Installed",
-                crate::micromamba::EnvironmentStatus::Missing => "Missing",
-                crate::micromamba::EnvironmentStatus::Error(_) => "Error",
-            };
-
-            let created_str = env
-                .created_at
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_else(|| "Unknown".to_string());
-
-            env_array.push(json!({
-                "name": name,
-                "status": status_str,
-                "created": created_str,
-                "tools": env.tools,
-                "path": env.file_path
-            }));
-        }
-
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&Value::Object(
-                [
-                    ("environments".to_string(), Value::Array(env_array)),
-                    (
-                        "count".to_string(),
-                        Value::Number(serde_json::Number::from(environments.len()))
-                    )
-                ]
-                .into_iter()
-                .collect::<serde_json::Map<String, Value>>()
-            ))?
-        );
-    } else {
-        // Table format (original)
-        println!("\nConda Environments:");
-        println!("{:<30} {:<20} {}", "Name", "Status", "Created",);
-        println!("{:-<30} {:-<-20} {}", "-", "-", "-",);
-
-        for (name, env) in environments {
-            let status_str = match env.status {
-                crate::micromamba::EnvironmentStatus::Ready => "Ready",
-                crate::micromamba::EnvironmentStatus::Installed => "Installed",
-                crate::micromamba::EnvironmentStatus::NotInstalled => "Not Installed",
-                crate::micromamba::EnvironmentStatus::Missing => "Missing",
-                crate::micromamba::EnvironmentStatus::Error(_) => "Error",
-            };
-
-            let created_str = env
-                .created_at
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_else(|| "Unknown".to_string());
-
-            println!("{:<30} {:<20} {}", name, status_str, created_str);
-
-            if args.detailed {
-                println!("  Tools: {:?}", env.tools);
-                println!("  Path: {:?}", env.file_path);
-            }
-        }
-    }
-
-    if verbose {
-        info!("Found {} environments", environments.len());
-    }
-
-    Ok(())
+    // 直接显示所有 conda 环境
+    list_all_conda_environments(json).await
 }
 
 /// Execute environment validation
