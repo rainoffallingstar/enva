@@ -77,6 +77,10 @@ pub struct EnvValidateArgs {
 /// Environment list arguments
 #[derive(Debug, Clone, Args)]
 pub struct EnvListArgs {
+    /// Show all conda environments (not just enva-managed ones)
+    #[arg(short = 'a', long = "all", help = "Show all conda environments instead of just enva-managed ones")]
+    pub all: bool,
+
     /// Show detailed information
     #[arg(long)]
     pub detailed: bool,
@@ -367,6 +371,11 @@ async fn execute_env_create(
 /// Execute environment list
 async fn execute_env_list(args: EnvListArgs, verbose: bool, json: bool) -> Result<()> {
     info!("Listing conda environments...");
+
+    // If --all flag is used, show all conda environments
+    if args.all {
+        return list_all_conda_environments(json).await;
+    }
 
     let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
         error!("Failed to initialize MicromambaManager: {}", e);
@@ -749,4 +758,65 @@ async fn install_r_packages_in_environment(
             Err(e)
         }
     }
+}
+
+/// List all conda environments (not just enva-managed ones)
+///
+/// This function displays all conda environments in the system,
+/// showing their names and prefix paths.
+async fn list_all_conda_environments(json: bool) -> Result<()> {
+    use crate::micromamba::MicromambaManager;
+
+    // Get the global manager
+    let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
+        error!("Failed to initialize MicromambaManager: {}", e);
+        EnvError::Execution(
+            "Micromamba not found and auto-install failed.".to_string(),
+        )
+    })?;
+
+    let manager = micromamba_manager.lock().await;
+
+    // Get all conda environments
+    let environments = manager.get_all_conda_environments().await?;
+
+    if json {
+        // JSON output
+        use serde_json::Value;
+        let env_array: Vec<Value> = environments
+            .iter()
+            .map(|env| {
+                serde_json::json!({
+                    "name": env.name,
+                    "prefix": env.prefix,
+                    "active": env.is_active,
+                })
+            })
+            .collect();
+
+        let output = serde_json::json!({
+            "environments": env_array,
+            "count": environments.len()
+        });
+
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        // Table format
+        if environments.is_empty() {
+            info!("No conda environments found");
+            return Ok(());
+        }
+
+        println!();
+        println!("{:<30} | {}", "Name", "Prefix");
+        println!("{}", "-".repeat(100));
+
+        for env in &environments {
+            let active_mark = if env.is_active { "*" } else { "" };
+            println!("{:<30} | {}", format!("{}{}", env.name, active_mark), env.prefix);
+        }
+        println!();
+    }
+
+    Ok(())
 }

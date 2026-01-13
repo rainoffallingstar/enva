@@ -1598,6 +1598,107 @@ dependencies:
 "#
         .to_string()
     }
+
+    /// Get all conda environments from the system
+    ///
+    /// This function executes `conda env list` (or mamba/micromamba) and parses the output
+    /// to return a list of all conda environments with their names and prefixes.
+    pub async fn get_all_conda_environments(&self) -> Result<Vec<CondaEnvironment>> {
+        let cmd_name = match &self.pm {
+            PackageManager::Conda => "conda",
+            PackageManager::Mamba => "mamba",
+            PackageManager::Micromamba => "micromamba",
+            PackageManager::None => {
+                return Ok(vec![]);
+            }
+        };
+
+        debug!("Executing {} env list", cmd_name);
+
+        // Execute conda env list
+        let output = tokio::process::Command::new(cmd_name)
+            .args(&["env", "list"])
+            .output()
+            .await
+            .map_err(|e| EnvError::PackageManagerNotFound(cmd_name.to_string()))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EnvError::CommandFailed(format!(
+                "Failed to list environments: {}",
+                stderr
+            )));
+        }
+
+        // Parse the output
+        parse_conda_env_list(&output.stdout)
+    }
+}
+
+/// Conda environment information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CondaEnvironment {
+    /// Environment name
+    pub name: String,
+    /// Environment prefix path
+    pub prefix: String,
+    /// Whether this environment is currently active
+    pub is_active: bool,
+}
+
+/// Parse conda env list output
+///
+/// Expected format:
+/// ```text
+/// # conda environments:
+/// #
+/// base                  * /path/to/miniconda3
+/// env1                     /path/to/miniconda3/envs/env1
+/// env2                     /path/to/miniconda3/envs/env2
+/// ```
+fn parse_conda_env_list(output: &[u8]) -> Result<Vec<CondaEnvironment>> {
+    let content = String::from_utf8_lossy(output);
+    let mut environments = Vec::new();
+
+    for line in content.lines() {
+        // Skip comments and empty lines
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+
+        // Parse line: name * /path/to/env
+        // The second field (*) indicates the active environment
+        let parts: Vec<&str> = line.split_whitespace().collect();
+
+        if parts.len() >= 2 {
+            let name = parts[0].to_string();
+
+            // Check if this is the active environment
+            let is_active = parts.get(1).map(|&s| s == "*").unwrap_or(false);
+
+            // The prefix is the last field (after potential * marker)
+            // Format: name [*] prefix
+            let prefix = if is_active {
+                // "name * /path" -> parts.len() >= 3
+                if parts.len() >= 3 {
+                    parts[2].to_string()
+                } else {
+                    continue; // Invalid format
+                }
+            } else {
+                // "name /path" -> parts.len() >= 2
+                parts[1].to_string()
+            };
+
+            environments.push(CondaEnvironment {
+                name,
+                prefix,
+                is_active,
+            });
+        }
+    }
+
+    Ok(environments)
 }
 
 #[cfg(test)]
