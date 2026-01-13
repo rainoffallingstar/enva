@@ -22,7 +22,7 @@ A lightweight, standalone micromamba environment manager for bioinformatics work
 - **Performance Optimizations**:
   - 2-3x faster than conda
   - 30% smaller disk footprint
-  - Binary size: 4.9MB (release) vs 50MB (xdxtools)
+  - Binary size: 5.4MB (release) vs 50MB (xdxtools)
 
 ## 📦 Installation
 
@@ -30,7 +30,7 @@ A lightweight, standalone micromamba environment manager for bioinformatics work
 
 Download the latest release from the `release-YYYYMMDD-HHMMSS/` directory:
 - `enva-windows-x86_64.exe` (Windows)
-- `enva-linux-x86_64` (Linux - static binary)
+- `enva-linux-x86_64` (Linux)
 - `enva-macos-x86_64` (macOS Intel)
 - `enva-macos-aarch64` (macOS Apple Silicon)
 
@@ -121,7 +121,7 @@ cargo build --release
 
 ## 🔧 Configuration
 
-Environment configurations are stored in `src/configs/`:
+Environment configurations are defined in `src/configs/`:
 - `xdxtools-core.yaml`: Core bioinformatics tools
 - `xdxtools-r.yaml`: R/Bioconductor packages
 - `xdxtools-snakemake.yaml`: Workflow engine
@@ -131,10 +131,10 @@ Environment configurations are stored in `src/configs/`:
 
 | Metric | xdxtools | enva | Improvement |
 |--------|----------|------|-------------|
-| Binary Size | ~50MB | 4.9MB | **90% smaller** |
-| Startup Time | 2-3s | 0.17s | **12-18x faster** |
+| Binary Size | ~50MB | 5.4MB | **89% smaller** |
+| Startup Time | 2-3s | ~0.2s | **10-15x faster** |
 | Memory Usage | ~100MB | ~30MB | **70% less** |
-| Dependencies | ~50 | 16 | **68% reduction** |
+| Dependencies | ~50 | 9 | **82% reduction** |
 
 ## 🎓 Migration from xdxtools
 
@@ -157,7 +157,7 @@ Commands:
   install   Install components in environment
   remove    Remove conda environment
   run       Run command or script in environment
-  help      Print help
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -v, --verbose    Enable verbose output
@@ -167,6 +167,48 @@ Options:
       --json       Output in JSON format
   -h, --help       Print help
   -V, --version    Print version
+```
+
+## 🔍 Troubleshooting
+
+### Common Issues
+
+#### Environment creation fails
+- **Error**: "Failed to create environment"
+- **Solution**: Check micromamba installation, verify YAML config syntax
+- **Exit code**: 1
+
+#### Package not found
+- **Error**: "Package installation failed: package not found"
+- **Solution**: Verify package name, check channel availability
+- **Exit code**: 1
+
+#### Configuration file error
+- **Error**: "Failed to parse YAML configuration"
+- **Solution**: Validate YAML syntax, check file path
+- **Exit code**: 3
+
+### Exit Codes
+
+- `0`: Success
+- `1`: General error
+- `2`: Command line argument error
+- `3`: Configuration file error
+- `4`: Network/download error
+
+### Configuration Override
+
+You can override the default package manager by setting the `ENVA_PACKAGE_MANAGER` environment variable:
+
+```bash
+# Force use of conda
+ENVA_PACKAGE_MANAGER=conda enva create --core
+
+# Force use of mamba
+ENVA_PACKAGE_MANAGER=mamba enva create --core
+
+# Force use of micromamba
+ENVA_PACKAGE_MANAGER=micromamba enva create --core
 ```
 
 ## 🛠️ Development
