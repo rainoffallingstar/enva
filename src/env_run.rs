@@ -2,27 +2,31 @@
 
 use crate::error::{Result, EnvError};
 use crate::micromamba::MicromambaManager;
+use crate::package_manager::PackageManager;
 use clap::Args;
 use std::path::PathBuf;
 use tracing::{error, info};
 
 /// Environment run arguments
+/// Supports both positional and flag-based syntax:
+/// - Positional: enva run <env> <cmd>
+/// - Flags: enva run --name <env> --command "<cmd>"
 #[derive(Debug, Clone, Args)]
 pub struct EnvRunArgs {
-    /// Environment name (required)
-    #[arg(short, long)]
-    pub name: String,
+    /// Environment name (can be positional or via --name/-n)
+    #[arg(short, long, value_name = "ENV")]
+    pub name: Option<String>,
 
-    /// Command to execute (exclusive with --script)
-    #[arg(required_unless_present = "script")]
+    /// Command to execute (via --command flag only)
+    #[arg(long, value_name = "CMD")]
     pub command: Option<String>,
 
     /// Script file path (exclusive with command)
-    #[arg(short, long)]
+    #[arg(short, long, value_name = "SCRIPT")]
     pub script: Option<PathBuf>,
 
-    /// Arguments for command/script
-    #[arg(trailing_var_arg = true)]
+    /// Positional arguments: [env_name, command_parts...]
+    #[arg(value_name = "ARGS")]
     pub args: Vec<String>,
 
     /// Working directory
@@ -38,40 +42,91 @@ pub struct EnvRunArgs {
     pub no_capture: bool,
 }
 
+impl EnvRunArgs {
+    /// Get environment name (resolve from either --name flag or first positional arg)
+    pub fn get_env_name(&self) -> Result<String> {
+        // Priority: --name flag > first positional arg
+        if let Some(ref name) = self.name {
+            return Ok(name.clone());
+        }
+
+        // Try to get from first positional arg
+        if !self.args.is_empty() {
+            return Ok(self.args[0].clone());
+        }
+
+        Err(EnvError::Validation("Missing environment name".to_string()))
+    }
+
+    /// Get command (resolve from either --command flag or positional args)
+    pub fn get_command(&self) -> Result<String> {
+        // Priority: --command flag > positional args (skip env_name)
+        if let Some(ref cmd) = self.command {
+            return Ok(cmd.clone());
+        }
+
+        // Build from positional args (skip first if it's env name)
+        let start_idx = if self.name.is_some() { 0 } else { 1 };
+        let args: Vec<&str> = self.args.iter()
+            .skip(start_idx)
+            .map(|s| s.as_str())
+            .collect();
+
+        if args.is_empty() {
+            return Err(EnvError::Validation("Missing command".to_string()));
+        }
+
+        Ok(args.join(" "))
+    }
+}
+
 /// Execute environment run command
 pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
+    // Parse environment name and command
+    let env_name = args.get_env_name()?;
+    let full_command = if let Some(ref script) = args.script {
+        format!("Rscript {}", script.display())
+    } else {
+        args.get_command()?
+    };
+
     if verbose {
-        info!("Executing command in environment '{}'", args.name);
+        info!("Executing in environment '{}': {}", env_name, full_command);
     }
 
     // Validate arguments
     validate_args(&args)?;
 
     // Get global MicromambaManager
-    let micromamba_manager = crate::micromamba::MicromambaManager::get_global_manager()
+    let micromamba_manager = MicromambaManager::get_global_manager()
         .await
         .map_err(|e| {
             error!("Failed to initialize MicromambaManager: {}", e);
             EnvError::Execution(
-                "Micromamba not found and auto-install failed.".to_string(),
+                "Package manager not found and auto-install failed.".to_string(),
             )
         })?;
 
     let manager = micromamba_manager.lock().await;
 
+    // Log which package manager is being used
+    let pm = manager.get_package_manager();
+    if verbose {
+        info!("Using package manager: {}", pm);
+    } else if pm != PackageManager::Micromamba {
+        // Log if using non-default PM (conda/mamba)
+        info!("Using package manager: {} (auto-detected)", pm);
+    }
+
     // Check if environment exists
-    if !manager.environment_exists(&args.name).await? {
+    if !manager.environment_exists(&env_name).await? {
         return Err(EnvError::Execution(format!(
             "Environment '{}' does not exist",
-            args.name
+            env_name
         )));
     }
 
-    // Build the full command
-    let full_command = build_full_command(&args)?;
-
     if verbose {
-        info!("Executing: {}", full_command);
         info!("Working directory: {:?}", args.cwd);
         info!("Environment variables: {:?}", args.env);
     }
@@ -80,7 +135,7 @@ pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
     // Note: Handle SIGPIPE (exit code 141) gracefully
     match manager
         .run_in_environment_extended(
-            &args.name,
+            &env_name,
             &full_command,
             &args.env,
             &args.cwd,
@@ -115,6 +170,7 @@ pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
 
 /// Build the full command string from arguments
 fn build_full_command(args: &EnvRunArgs) -> Result<String> {
+    // This function is now deprecated - use get_command() instead
     if let Some(ref script) = args.script {
         let mut cmd = format!("Rscript {}", script.display());
 
@@ -135,10 +191,18 @@ fn build_full_command(args: &EnvRunArgs) -> Result<String> {
 
 /// Validate command arguments
 fn validate_args(args: &EnvRunArgs) -> Result<()> {
-    // Check that either command or script is provided
-    if args.command.is_none() && args.script.is_none() {
+    // Check that either command, script, or positional args are provided
+    let has_positional_cmd = if args.name.is_some() {
+        // If --name is used, args should contain the command
+        !args.args.is_empty()
+    } else {
+        // If --name is not used, args[0] is env name, args[1+] should be command
+        args.args.len() > 1
+    };
+
+    if args.command.is_none() && args.script.is_none() && !has_positional_cmd {
         return Err(EnvError::Validation(
-            "Must specify either --command or --script".to_string(),
+            "Must specify either --command, --script, or positional command".to_string(),
         ));
     }
 

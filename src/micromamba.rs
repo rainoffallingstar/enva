@@ -14,6 +14,7 @@
 //! - Performance: 2-3x faster than conda
 
 use crate::error::{Result, EnvError};
+use crate::package_manager::{PackageManager, PackageManagerDetector};
 use async_trait::async_trait;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest;
@@ -164,8 +165,10 @@ impl Default for VersionConfig {
 
 /// Micromamba manager for simplified environment handling
 pub struct MicromambaManager {
-    /// Path to micromamba executable
-    micromamba_path: PathBuf,
+    /// Path to package manager executable (conda/mamba/micromamba)
+    pm_path: PathBuf,
+    /// Detected package manager type
+    pm_type: PackageManager,
     /// Environment configurations
     environments: HashMap<String, MicromambaEnvironment>,
     /// Base directory for environment files
@@ -179,7 +182,8 @@ pub struct MicromambaManager {
 impl Clone for MicromambaManager {
     fn clone(&self) -> Self {
         Self {
-            micromamba_path: self.micromamba_path.clone(),
+            pm_path: self.pm_path.clone(),
+            pm_type: self.pm_type,
             environments: self.environments.clone(),
             config_dir: self.config_dir.clone(),
             version_config: self.version_config.clone(),
@@ -235,13 +239,40 @@ fn normalize_and_validate_path(path: &Path) -> Result<PathBuf> {
 }
 
 impl MicromambaManager {
-    /// Create new micromamba manager (auto-installs micromamba if not found)
+    /// Create new manager with automatic package manager detection
+    /// Detects and uses: conda → mamba → micromamba (in priority order)
     pub async fn new() -> Result<Self> {
-        let micromamba_path = Self::find_or_install_micromamba().await?;
+        // 1. Detect package manager with priority
+        let mut detector = PackageManagerDetector::new();
+        let pm_type = detector.detect_with_env_override()?;
+
+        // 2. Get PM path based on detection
+        let pm_path = match pm_type {
+            PackageManager::Conda | PackageManager::Mamba => {
+                // conda/mamba usually in PATH
+                which(pm_type.command()).map_err(|_| {
+                    EnvError::Config(format!("{} not found in PATH", pm_type))
+                })?
+            }
+            PackageManager::Micromamba => {
+                // micromamba might need to be downloaded
+                Self::find_or_install_micromamba().await?
+            }
+            PackageManager::None => {
+                return Err(EnvError::Config(
+                    "No package manager found (conda/mamba/micromamba)".to_string()
+                ));
+            }
+        };
+
+        info!("✓ Package manager: {} ({})", pm_type, pm_path.display());
+
+        // 3. Initialize other fields
         let config_dir = Self::get_cache_config_dir()?;
 
         let mut manager = Self {
-            micromamba_path,
+            pm_path,
+            pm_type,
             environments: HashMap::new(),
             config_dir,
             version_config: VersionConfig::default(),
@@ -250,6 +281,16 @@ impl MicromambaManager {
 
         manager.initialize_environments(true).await?;
         Ok(manager)
+    }
+
+    /// Get detected package manager
+    pub fn get_package_manager(&self) -> PackageManager {
+        self.pm_type
+    }
+
+    /// Get package manager path
+    pub fn get_pm_path(&self) -> &Path {
+        &self.pm_path
     }
 
     /// Get cache directory for configuration files
@@ -286,11 +327,12 @@ impl MicromambaManager {
 
     /// Create micromamba manager with custom config directory
     pub async fn with_config_dir<P: AsRef<Path>>(config_dir: P) -> Result<Self> {
-        let micromamba_path = Self::find_or_install_micromamba().await?;
+        let pm_path = Self::find_or_install_micromamba().await?;
         let config_dir = config_dir.as_ref().to_path_buf();
 
         let mut manager = Self {
-            micromamba_path,
+            pm_path,
+            pm_type: PackageManager::Micromamba,
             environments: HashMap::new(),
             config_dir,
             version_config: VersionConfig::default(),
@@ -306,11 +348,12 @@ impl MicromambaManager {
         config_dir: P,
         version_config: VersionConfig,
     ) -> Result<Self> {
-        let micromamba_path = Self::find_or_install_micromamba().await?;
+        let pm_path = Self::find_or_install_micromamba().await?;
         let config_dir = config_dir.as_ref().to_path_buf();
 
         let mut manager = Self {
-            micromamba_path,
+            pm_path,
+            pm_type: PackageManager::Micromamba,
             environments: HashMap::new(),
             config_dir,
             version_config,
@@ -330,9 +373,9 @@ impl MicromambaManager {
     fn build_env_vars(&self) -> HashMap<String, String> {
         let mut env_vars = HashMap::new();
 
-        // Get micromamba directory
-        let micromamba_dir = self
-            .micromamba_path
+        // Get package manager directory
+        let pm_dir = self
+            .pm_path
             .parent()
             .unwrap_or(Path::new("."));
 
@@ -340,7 +383,7 @@ impl MicromambaManager {
         let mamba_root = self.get_mamba_root_prefix();
 
         // Set LD_LIBRARY_PATH
-        let lib_dir = micromamba_dir.join("lib");
+        let lib_dir = pm_dir.join("lib");
         let existing_ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
         let new_ld_path = if existing_ld_path.is_empty() {
             lib_dir.to_string_lossy().to_string()
@@ -357,7 +400,7 @@ impl MicromambaManager {
         let existing_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!(
             "{}:{}",
-            micromamba_dir.to_string_lossy(),
+            pm_dir.to_string_lossy(),
             existing_path
         );
         env_vars.insert("PATH".to_string(), new_path);
@@ -376,7 +419,7 @@ impl MicromambaManager {
         }
 
         // Default to parent directory of micromamba binary
-        self.micromamba_path
+        self.pm_path
             .parent()
             .and_then(|dir| {
                 // Check if this looks like a standard micromamba installation
@@ -930,7 +973,7 @@ impl MicromambaManager {
 
     /// Validate micromamba installation
     async fn validate_micromamba(&self) -> Result<bool> {
-        let mut cmd = AsyncCommand::new(&self.micromamba_path);
+        let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("--version");
 
         // Apply environment variables
@@ -968,7 +1011,7 @@ impl MicromambaManager {
 
         pb.set_message("Creating environment...");
         info!("Building micromamba command for {:?}", yaml_file);
-        let mut cmd = AsyncCommand::new(&self.micromamba_path);
+        let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("env")
             .arg("create")
             .arg("-f")
@@ -1026,7 +1069,7 @@ Please remove the existing directory and try again, or use a different environme
 
     /// Run command in environment
     pub async fn run_in_environment(&self, env_name: &str, command: &str) -> Result<Output> {
-        let mut cmd = AsyncCommand::new(&self.micromamba_path);
+        let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("run")
             .arg("-n")
             .arg(env_name)
@@ -1050,7 +1093,8 @@ Please remove the existing directory and try again, or use a different environme
         cwd: &Path,
         capture_output: bool,
     ) -> Result<()> {
-        let mut cmd = AsyncCommand::new(&self.micromamba_path);
+        // Use detected package manager
+        let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("run")
             .arg("-n")
             .arg(env_name);
@@ -1128,7 +1172,7 @@ Please remove the existing directory and try again, or use a different environme
 
     /// Check if environment exists
     pub async fn environment_exists(&self, env_name: &str) -> Result<bool> {
-        let mut cmd = AsyncCommand::new(&self.micromamba_path);
+        let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("env").arg("list").arg("--json");
 
         // Apply environment variables
@@ -1171,7 +1215,7 @@ Please remove the existing directory and try again, or use a different environme
 
     /// Remove environment
     pub async fn remove_environment(&self, env_name: &str) -> Result<()> {
-        let mut cmd = AsyncCommand::new(&self.micromamba_path);
+        let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("env")
             .arg("remove")
             .arg("-n")
@@ -1275,9 +1319,10 @@ Please remove the existing directory and try again, or use a different environme
         Ok(envs)
     }
 
-    /// Get micromamba executable path
+    /// Get package manager executable path
+    /// Note: Method name kept for backward compatibility
     pub fn micromamba_path(&self) -> &PathBuf {
-        &self.micromamba_path
+        &self.pm_path
     }
 
     /// Get environment by name
@@ -1315,7 +1360,7 @@ Please remove the existing directory and try again, or use a different environme
         info!("Installing R packages from GitHub using micromamba...");
 
         // Get R executable path from the environment
-        let mut cmd = AsyncCommand::new(&self.micromamba_path);
+        let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("run")
            .arg("-n")
            .arg("xdxtools-r")
@@ -1361,10 +1406,10 @@ Please remove the existing directory and try again, or use a different environme
         }
 
         info!("Installing packages in environment '{}': {:?}", env_name, packages);
-        debug!("micromamba path: {:?}", self.micromamba_path);
+        debug!("micromamba path: {:?}", self.pm_path);
 
         // Build micromamba install command with default channels
-        let mut cmd = AsyncCommand::new(&self.micromamba_path);
+        let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("install")
             .arg("-n")
             .arg(env_name)

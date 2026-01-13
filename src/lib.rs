@@ -1,6 +1,7 @@
 //! enva - A lightweight micromamba environment manager for bioinformatics workflows
 
 pub mod error;
+pub mod package_manager;
 pub mod micromamba;
 pub mod env;
 pub mod env_run;
@@ -8,6 +9,7 @@ pub mod env_run;
 // Re-export commonly used types
 pub use error::{EnvError, Result};
 pub use env::{EnvArgs, execute_env_command};
+pub use package_manager::{PackageManager, PackageManagerDetector, get_global_detector};
 
 // Constants for the 4 core environments
 pub const CORE_ENV_NAME: &str = "xdxtools-core";
