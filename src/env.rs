@@ -56,10 +56,6 @@ pub struct EnvCreateArgs {
     /// Environment name (for custom environments)
     #[arg(long)]
     pub name: Option<String>,
-
-    /// Skip automatic R package installation (for offline environments)
-    #[arg(long)]
-    pub skip_r_packages: bool,
 }
 
 /// Environment validation arguments
@@ -328,19 +324,6 @@ async fn execute_env_create(
             Ok(_) => {
                 success_count += 1;
                 info!("Successfully created environment: {}", env_name);
-
-                // Auto-install R packages for xdxtools-r environment (non-blocking)
-                // Note: We drop the lock before calling this function to avoid deadlock
-                drop(manager);
-                if !dry_run {
-                    if let Err(e) = install_r_packages_in_environment(
-                        env_name,
-                        verbose,
-                        args.skip_r_packages
-                    ).await {
-                        warn!("R package installation failed for {} (non-blocking): {}", env_name, e);
-                    }
-                }
             }
             Err(e) => {
                 failed_count += 1;
@@ -542,117 +525,6 @@ async fn execute_env_remove(name: String, verbose: bool) -> Result<()> {
         }
         Err(e) => {
             error!("Failed to remove environment {}: {}", name, e);
-            Err(e)
-        }
-    }
-}
-
-/// Find the R installation script (unified_install.R)
-/// Searches in the following order:
-/// 1. Current directory: ./scripts/r-install/unified_install.R
-/// 2. Executable directory: <exe-dir>/scripts/r-install/unified_install.R
-/// 3. Environment variable: $XDXTOOLS_SCRIPTS_DIR/unified_install.R
-fn find_r_install_script() -> Result<PathBuf> {
-    let script_name = "unified_install.R";
-
-    // Priority 1: Current directory
-    let current_dir = std::env::current_dir()
-        .map_err(|e| EnvError::FileOperation(format!("Failed to get current directory: {}", e)))?;
-    let script_path = current_dir.join("scripts").join("r-install").join(script_name);
-    if script_path.exists() {
-        return Ok(script_path);
-    }
-
-    // Priority 2: Executable directory
-    if let Some(exe_path) = std::env::current_exe().ok() {
-        let exe_dir = exe_path.parent()
-            .ok_or_else(|| EnvError::FileOperation("Failed to get executable directory".to_string()))?;
-        let script_path = exe_dir.join("scripts").join("r-install").join(script_name);
-        if script_path.exists() {
-            return Ok(script_path);
-        }
-    }
-
-    // Priority 3: Environment variable
-    if let Some(script_dir) = std::env::var("XDXTOOLS_SCRIPTS_DIR").ok() {
-        let script_path = PathBuf::from(script_dir).join(script_name);
-        if script_path.exists() {
-            return Ok(script_path);
-        }
-    }
-
-    Err(EnvError::FileOperation(
-        format!(
-            "R installation script '{}' not found. Please ensure the script is available in one of the following locations:\n\
-             1. ./scripts/r-install/{}\n\
-             2. <executable-dir>/scripts/r-install/{}\n\
-             3. $XDXTOOLS_SCRIPTS_DIR/{}",
-            script_name, script_name, script_name, script_name
-        )
-    ))
-}
-
-/// Install R packages in environment after creation
-async fn install_r_packages_in_environment(
-    env_name: &str,
-    verbose: bool,
-    skip_r_packages: bool,
-) -> Result<()> {
-    // Skip if explicitly requested
-    if skip_r_packages {
-        if verbose {
-            info!("Skipping R package installation for {} (--skip-r-packages specified)", env_name);
-        }
-        return Ok(());
-    }
-
-    // Only install for xdxtools-r environment
-    if env_name != "xdxtools-r" {
-        return Ok(());
-    }
-
-    // Find the R installation script
-    let script_path = find_r_install_script()?;
-
-    if verbose {
-        info!("Found R installation script at: {:?}", script_path);
-        info!("Installing R packages in {} environment...", env_name);
-    } else {
-        info!("Installing R packages in {} environment...", env_name);
-    }
-
-    // Use global MicromambaManager
-    let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
-        error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution(
-            "Micromamba not found and auto-install failed.".to_string(),
-        )
-    })?;
-
-    let manager = micromamba_manager.lock().await;
-
-    // Execute the R installation script via env run
-    let script_path_str = script_path.to_str()
-        .ok_or_else(|| EnvError::FileOperation("Invalid script path".to_string()))?;
-
-    // Use the run_in_environment_extended method with no capture for real-time output
-    let result = manager.run_in_environment_extended(
-        env_name,
-        &format!("Rscript {}", script_path_str),
-        &[],
-        std::path::Path::new("."),
-        false, // Don't capture output, show in real-time
-    ).await;
-
-    match result {
-        Ok(_) => {
-            info!("R packages installed successfully in {}", env_name);
-            Ok(())
-        }
-        Err(e) => {
-            warn!("R package installation failed for {}: {}", env_name, e);
-            warn!("You can manually retry with:");
-            warn!("  xdxtools env run --name {} --script scripts/r-install/unified_install.R -- all", env_name);
             Err(e)
         }
     }
