@@ -920,6 +920,7 @@ impl MicromambaManager {
     async fn auto_copy_config_templates(&self, verbose: bool) -> Result<()> {
         let source_config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("src")
+            .join("environments")
             .join("configs");
 
         // Check if configuration directory exists and has files

@@ -7,44 +7,90 @@ dependencies:
   # R Base
   - r-base=4.4.3
 
-  # Compilation dependencies for R packages
-  - zlib
-  - libcurl
-  - libgit2
-  - openssl
-  - libssh2
-
-  # LAPACK dependencies (fixes Matrix package loading)
-  - lapack
-  - xz
-
   # Qualimap (从 xdxtools-core 迁移过来)
   - qualimap
 
-  # Bioconductor Core (minimal set for compatibility)
+  # Bioconductor Core
   - bioconductor-biobase
   - bioconductor-biocgenerics
   - bioconductor-s4vectors
   - bioconductor-iranges
   - bioconductor-genomicranges
   - bioconductor-genomeinfodb
+  - bioconductor-rhtslib
+  - bioconductor-rtracklayer
+
+  # Methylation Analysis
+  - bioconductor-bsseq
+  - bioconductor-methrix
 
   # RNA-seq Analysis
   - bioconductor-deseq2
   - bioconductor-edger
   - bioconductor-limma
 
+  # Visualization and Reporting
+  - bioconductor-enhancedvolcano
+  - bioconductor-complexheatmap
+
+  # ChIP-seq/ATAC-seq Analysis
+  - bioconductor-chipseeker
+  - bioconductor-annotationdbi
+  - bioconductor-org.hs.eg.db
+  - bioconductor-org.mm.eg.db
+  - bioconductor-genomicalignments
+  - bioconductor-ensembldb
+
+  # Statistical Analysis
+  - bioconductor-sva
+  - bioconductor-clusterprofiler
+  - r-msigdbr
+  - bioconductor-org.hs.eg.db
+  - bioconductor-TCGAbiolinks
+  - bioconductor-biomart
+  - bioconductor-gsva
+
   # Data Manipulation
   - r-data.table
+  - r-reshape2
   - r-readxl
   - r-openxlsx
+  - r-xlsx
+
+  # Genomic Analysis
+  - bioconductor-rsamtools
+  - bioconductor-genomicdatacommons
+  - bioconductor-bsgenome
+  - bioconductor-bsgenome.hsapiens.ucsc.hg19
+  - bioconductor-biostrings
 
   # Visualization & Web
   - r-plotly
-  - r-ggplot2
+  - r-dt
   - r-shiny
+  - r-ggplot2
+  - r-gridextra
   - r-ggpubr
 
+  # Specialized PDX Analysis
+  - r-xml2
+  - bioconductor-repitools
+  - bioconductor-noiseq
+
+  # Machine Learning
+  - r-seurat
+  - r-mlr3verse
+  - r-doparallel
+  - r-foreach
+  - r-domc
+
   # Additional Utilities
+  - r-png
+  - r-umap
+  - r-ggraph
+  - r-igraph
+  - r-proc
   - r-tidyverse
   - r-rcpp
+  - r-r6
+  - r-reticulate
