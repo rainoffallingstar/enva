@@ -1,9 +1,9 @@
 //! Package manager detection and abstraction
 //!
-//! Auto-detects and prioritizes: conda → mamba → micromamba
-//! - conda: Most compatible, slowest
+//! Auto-detects and prioritizes: micromamba → mamba → conda
+//! - micromamba: Fastest, lightweight (recommended)
 //! - mamba: 2-3x faster than conda
-//! - micromamba: 3-5x faster, lightweight
+//! - conda: Most compatible, slowest
 
 use crate::error::{Result, EnvError};
 use std::process::Command;
@@ -59,14 +59,15 @@ pub struct PackageManagerDetector {
 }
 
 impl PackageManagerDetector {
-    /// Default: conda → mamba → micromamba
-    pub fn new() -> Self {
+    /// Default: micromamba → mamba → conda
+/// Priority: micromamba (fastest, lightweight) → mamba → conda (slowest, most compatible)
+pub fn new() -> Self {
         Self {
             detected: None,
             detection_order: vec![
-                PackageManager::Conda,
-                PackageManager::Mamba,
                 PackageManager::Micromamba,
+                PackageManager::Mamba,
+                PackageManager::Conda,
             ],
         }
     }

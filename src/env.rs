@@ -221,26 +221,33 @@ async fn execute_env_create(
                 // Use default path: try multiple locations (same as actual execution)
                 let current_dir = std::env::current_dir().unwrap_or_default();
 
-                // Try src/configs/ first (development)
+                // Try envs/ first (xdxtools-runtime layout)
+                let runtime_envs = current_dir
+                    .join("envs")
+                    .join(format!("{}.yaml", env_name));
+
+                // Try src/configs/ second (development)
                 let src_config = current_dir
                     .join("src")
                     .join("configs")
                     .join(format!("{}.yaml", env_name));
 
-                // Try environments/configs/ second (release)
-                let envs_config = current_dir
+                // Try environments/configs/ third (release)
+                let release_config = current_dir
                     .join("environments")
                     .join("configs")
                     .join(format!("{}.yaml", env_name));
 
-                // Return whichever exists, prefer src/configs/
-                if src_config.exists() {
+                // Return whichever exists, prefer envs/ > src/configs/ > environments/configs/
+                if runtime_envs.exists() {
+                    runtime_envs
+                } else if src_config.exists() {
                     src_config
-                } else if envs_config.exists() {
-                    envs_config
+                } else if release_config.exists() {
+                    release_config
                 } else {
-                    // Return src path as default (will show as not found)
-                    src_config
+                    // Return runtime envs path as default (will show as not found)
+                    runtime_envs
                 }
             };
 
@@ -294,26 +301,33 @@ async fn execute_env_create(
                 ))
             })?;
 
-            // Try src/configs/ first (development)
+            // Try envs/ first (xdxtools-runtime layout)
+            let runtime_envs = current_dir
+                .join("envs")
+                .join(format!("{}.yaml", env_name));
+
+            // Try src/configs/ second (development)
             let src_config = current_dir
                 .join("src")
                 .join("configs")
                 .join(format!("{}.yaml", env_name));
 
-            // Try environments/configs/ second (release)
-            let envs_config = current_dir
+            // Try environments/configs/ third (release)
+            let release_config = current_dir
                 .join("environments")
                 .join("configs")
                 .join(format!("{}.yaml", env_name));
 
-            // Return whichever exists, prefer src/configs/
-            if src_config.exists() {
+            // Return whichever exists, prefer envs/ > src/configs/ > environments/configs/
+            if runtime_envs.exists() {
+                runtime_envs
+            } else if src_config.exists() {
                 src_config
-            } else if envs_config.exists() {
-                envs_config
+            } else if release_config.exists() {
+                release_config
             } else {
-                // Return src path as default (will fail with proper error)
-                src_config
+                // Return runtime envs path as default (will fail with proper error)
+                runtime_envs
             }
         };
 
