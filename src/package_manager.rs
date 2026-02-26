@@ -59,14 +59,14 @@ pub struct PackageManagerDetector {
 }
 
 impl PackageManagerDetector {
-    /// Default: conda → mamba → micromamba
+    /// Default: micromamba → mamba → conda (prioritize fastest)
     pub fn new() -> Self {
         Self {
             detected: None,
             detection_order: vec![
-                PackageManager::Conda,
-                PackageManager::Mamba,
                 PackageManager::Micromamba,
+                PackageManager::Mamba,
+                PackageManager::Conda,
             ],
         }
     }

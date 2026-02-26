@@ -373,11 +373,8 @@ impl MicromambaManager {
     fn build_env_vars(&self) -> HashMap<String, String> {
         let mut env_vars = HashMap::new();
 
-        // Get package manager directory
-        let pm_dir = self
-            .pm_path
-            .parent()
-            .unwrap_or(Path::new("."));
+        // Get package manager bin directory (not parent - we need the bin directory itself in PATH)
+        let pm_dir = self.pm_path.clone();
 
         // Calculate MAMBA_ROOT_PREFIX (parent of micromamba binary or dedicated prefix)
         let mamba_root = self.get_mamba_root_prefix();
@@ -396,7 +393,7 @@ impl MicromambaManager {
         };
         env_vars.insert("LD_LIBRARY_PATH".to_string(), new_ld_path);
 
-        // Set PATH
+        // Set PATH - put micromamba's bin directory FIRST to ensure it's used instead of conda
         let existing_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!(
             "{}:{}",
@@ -405,8 +402,22 @@ impl MicromambaManager {
         );
         env_vars.insert("PATH".to_string(), new_path);
 
+        // Also ensure we explicitly set the micromamba path to avoid PATH resolution issues
+        // This is critical when conda is in PATH
+
         // Note: Don't set MAMBA_ROOT_PREFIX to avoid overriding micromamba's default configuration
         // Let micromamba use its default base environment location
+
+        // Override _CONDA_ROOT to ensure micromamba uses the correct environment path
+        // This is needed when user has conda environment activated (sets _CONDA_ROOT)
+        // and micromamba is installed in a different location
+        let mamba_root_str = mamba_root.to_string_lossy().to_string();
+        env_vars.insert("_CONDA_ROOT".to_string(), mamba_root_str.clone());
+        env_vars.insert("MAMBA_ROOT_PREFIX".to_string(), mamba_root_str.clone());
+
+        // Also clear CONDA_PREFIX which might interfere
+        env_vars.insert("CONDA_PREFIX".to_string(), mamba_root_str.clone());
+        env_vars.insert("CONDA_DEFAULT_ENV".to_string(), "base".to_string());
 
         env_vars
     }
@@ -418,27 +429,34 @@ impl MicromambaManager {
             return PathBuf::from(prefix);
         }
 
-        // Default to parent directory of micromamba binary
-        self.pm_path
-            .parent()
-            .and_then(|dir| {
-                // Check if this looks like a standard micromamba installation
-                // Standard path: /path/to/bin/micromamba with root at /path/to/share/mamba
-                let potential_root = dir.parent().map(|p| p.join("share/mamba"));
-                if let Some(root) = potential_root {
-                    if root.exists() {
-                        return Some(root);
-                    }
-                }
-                // Fallback to parent directory
-                Some(dir.to_path_buf())
-            })
-            .unwrap_or_else(|| {
-                // Fallback to user home directory
-                dirs::home_dir()
-                    .map(|h| h.join(".local/share/mamba"))
-                    .unwrap_or_else(|| PathBuf::from("/tmp/micromamba"))
-            })
+        // Check multiple possible locations for micromamba root
+        // Priority: 1) ~/.local/share/mamba, 2) parent of bin directory, 3) ~/.local/share/mamba fallback
+
+        // First check ~/.local/share/mamba (most common for user-installed micromamba)
+        if let Some(home) = dirs::home_dir() {
+            let local_mamba = home.join(".local/share/mamba");
+            if local_mamba.exists() {
+                return local_mamba;
+            }
+        }
+
+        // Check if this looks like a standard micromamba installation
+        // Standard path: /path/to/bin/micromamba with root at /path/to/share/mamba
+        if let Some(dir) = self.pm_path.parent() {
+            let potential_root = dir.join("share/mamba");
+            if potential_root.exists() {
+                return potential_root;
+            }
+            // Also check if there's an 'envs' subdirectory in the parent
+            if dir.join("envs").exists() {
+                return dir.to_path_buf();
+            }
+        }
+
+        // Fallback to user home directory
+        dirs::home_dir()
+            .map(|h| h.join(".local/share/mamba"))
+            .unwrap_or_else(|| PathBuf::from("/tmp/micromamba"))
     }
 
     /// Apply environment variables to a command
@@ -1093,29 +1111,25 @@ Please remove the existing directory and try again, or use a different environme
         cwd: &Path,
         capture_output: bool,
     ) -> Result<()> {
-        // Use detected package manager
-        let mut cmd = AsyncCommand::new(&self.pm_path);
-        cmd.arg("run")
-            .arg("-n")
-            .arg(env_name);
+        // Get the environment variables to set
+        let micromamba_env = self.build_env_vars();
 
-        // Add environment variables
-        for env_pair in env_vars {
-            if let Some((key, value)) = env_pair.split_once('=') {
-                cmd.env(key, value);
-            }
+        // Build command as a single shell command
+        let mut env_cmd = String::new();
+        for (key, value) in &micromamba_env {
+            env_cmd.push_str(&format!("export {}={}; ", key, value));
         }
+        // Use micromamba directly (not through bash -c which causes issues with --no-capture-output)
+        env_cmd.push_str(&format!("{} run -n {} {}",
+            self.pm_path.to_string_lossy(), env_name, command));
 
-        // Use bash -c to execute command with proper shell features
-        cmd.arg("bash")
-            .arg("-c")
-            .arg(command);
+
+        // Use bash -c to execute with our environment
+        let mut cmd = AsyncCommand::new("bash");
+        cmd.arg("-c").arg(&env_cmd);
 
         // Set working directory
         cmd.current_dir(cwd);
-
-        // Apply standard micromamba environment variables
-        self.apply_env_to_command(&mut cmd);
 
         // Set output configuration
         if capture_output {
