@@ -1,10 +1,9 @@
 //! Micromamba environment management for enva
 //!
-//! Provides simplified micromamba environment management for the 4 core environments:
-//! - xdxtools-core: All bioinformatics tools (without qualimap)
-//! - xdxtools-r: R/Bioconductor packages + qualimap
+//! Provides simplified micromamba environment management for the 3 core environments:
+//! - xdxtools-core: All bioinformatics tools (includes qualimap)
 //! - xdxtools-snakemake: Workflow engine
-//! - xdxtools-extra: Additional visualization and analysis tools (without R packages)
+//! - xdxtools-extra: Additional visualization and analysis tools
 //!
 //! Key features:
 //! - Automatic micromamba installation if not found
@@ -64,11 +63,8 @@ pub const TOOL_ENVIRONMENT_MAP: &[(&str, &str)] = &[
     ("phantompeakqualtools", "xdxtools-core"),
     ("bwa-index", "xdxtools-core"),     // BWA index building
     ("bowtie2-build", "xdxtools-core"), // Bowtie2 index building
-    // Qualimap -> xdxtools-r (moved from core)
-    ("qualimap", "xdxtools-r"),
-    // R packages -> xdxtools-r
-    ("R", "xdxtools-r"),
-    ("Rscript", "xdxtools-r"),
+    // Qualimap -> xdxtools-core
+    ("qualimap", "xdxtools-core"),
     // Snakemake -> xdxtools-snakemake
     ("snakemake", "xdxtools-snakemake"),
     ("jinja2", "xdxtools-snakemake"),
@@ -878,7 +874,6 @@ impl MicromambaManager {
         // Load environment configurations
         let env_names = [
             "xdxtools-core",
-            "xdxtools-r",
             "xdxtools-snakemake",
             "xdxtools-extra",
         ];
@@ -949,7 +944,7 @@ impl MicromambaManager {
                 .filter(|e| e.file_name().to_string_lossy().ends_with(".yaml"))
                 .count();
 
-            if yaml_count >= 4 {
+            if yaml_count >= 3 {
                 if verbose {
                     debug!("Configuration templates already exist, skipping copy");
                 }
@@ -968,7 +963,6 @@ impl MicromambaManager {
         // Copy all YAML files
         let files = [
             "xdxtools-core.yaml",
-            "xdxtools-r.yaml",
             "xdxtools-snakemake.yaml",
             "xdxtools-extra.yaml",
         ];
@@ -1445,7 +1439,6 @@ Please remove the existing directory and try again, or use a different environme
     pub fn generate_environment_file(&self, env_name: &str) -> Result<String> {
         match env_name {
             "xdxtools-core" => Ok(self.generate_xdxtools_core_yaml()),
-            "xdxtools-r" => Ok(self.generate_xdxtools_r_yaml()),
             "xdxtools-snakemake" => Ok(self.generate_xdxtools_snakemake_yaml()),
             "xdxtools-extra" => Ok(self.generate_xdxtools_extra_yaml()),
             _ => Err(EnvError::Validation(format!(
@@ -1462,60 +1455,28 @@ channels:
   - conda-forge
   - bioconda
 dependencies:
-  - python=3.10
-  - numpy=1.24
+  - python=3.10.13
+  - numpy=1.24.4
   - pandas
-  - matplotlib
-  - seaborn
-  - scipy
-  - scikit-learn
-  - biopython
-  - cutadapt
   - fastqc
   - multiqc
-  - trimmomatic
-  - bowtie2
-  - hisat2
+  - seqkit
+  - seqtk
+  - qualimap
+  - bismark
+  - trim-galore
+  - samtools>=1.7
   - star
-  - subread
-  - samtools
-  - bcftools
-  - bedtools
-  - igvtools
+  - htseq
+  - rmats
   - picard
-  - gatk4
-  - snakemake
-  - pandas
-  - numpy
+  - macs2
+  - bwa=0.7.17
+  - bowtie2=2.5.4
+  - phantompeakqualtools=1.2.1
   - matplotlib
   - seaborn
-  - jupyter
-"#
-        .to_string()
-    }
-
-    /// Generate xdxtools-r environment YAML content
-    fn generate_xdxtools_r_yaml(&self) -> String {
-        r#"name: xdxtools-r
-channels:
-  - conda-forge
-  - bioconda
-dependencies:
-  - r-base=4.4.3
-  - qualimap
-  - r-tidyverse
-  - r-dplyr
-  - r-ggplot2
-  - r-pheatmap
-  - r-rcolorbrewer
-  - r-data.table
-  - r-readr
-  - r-stringr
-  - r-matrix
-  - r-genomicranges
-  - r-iranges
-  - r-s4vectors
-  - r-biocmanager
+  - pyyaml
 "#
         .to_string()
     }
@@ -1527,16 +1488,20 @@ channels:
   - conda-forge
   - bioconda
 dependencies:
-  - python=3.10
-  - snakemake
-  - pandas
-  - numpy
-  - matplotlib
-  - graphviz
+  - python=3.11.9
+  - numpy=1.24.4
+  - snakemake=9.4.1
   - pyyaml
-  - docutils
+  - pandas
+  - matplotlib
+  - networkx
+  - graphviz
   - jinja2
-  - setuptools
+  - click
+  - requests
+  - packaging
+  - git
+  - gitpython
 "#
         .to_string()
     }
@@ -1548,18 +1513,29 @@ channels:
   - conda-forge
   - bioconda
 dependencies:
-  - python=3.10
+  - python=3.10.13
+  - numpy=1.24.4
+  - pandas
+  - bedtools
+  - bcftools
+  - vcftools
+  - tabix
+  - scipy
+  - scikit-learn
+  - statsmodels
   - plotly
   - dash
-  - bokeh
-  - altair
   - streamlit
-  - dash-bootstrap-components
+  - jupyter
+  - jupyterlab
+  - flask
+  - requests
+  - beautifulsoup4
   - openpyxl
   - xlsxwriter
-  - pillow
-  - networkx
-  - python-igraph
+  - deepTools=3.5.5
+  - genrich=0.6
+  - homer=4.11
 "#
         .to_string()
     }

@@ -11,9 +11,8 @@ pub use error::{EnvError, Result};
 pub use env::{EnvArgs, execute_env_command};
 pub use package_manager::{PackageManager, PackageManagerDetector, get_global_detector};
 
-// Constants for the 4 core environments
+// Constants for the 3 core environments
 pub const CORE_ENV_NAME: &str = "xdxtools-core";
-pub const R_ENV_NAME: &str = "xdxtools-r";
 pub const SNAKEMAKE_ENV_NAME: &str = "xdxtools-snakemake";
 pub const EXTRA_ENV_NAME: &str = "xdxtools-extra";
 

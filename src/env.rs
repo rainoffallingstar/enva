@@ -37,10 +37,6 @@ pub struct EnvCreateArgs {
     #[arg(long)]
     pub core: bool,
 
-    /// Create xdxtools-r environment (R packages)
-    #[arg(long)]
-    pub r: bool,
-
     /// Create xdxtools-snakemake environment (workflow engine)
     #[arg(long)]
     pub snakemake: bool,
@@ -171,16 +167,12 @@ async fn execute_env_create(
         if args.all {
             environments_to_create.extend_from_slice(&[
                 "xdxtools-core",
-                "xdxtools-r",
                 "xdxtools-snakemake",
                 "xdxtools-extra",
             ]);
         } else {
             if args.core {
                 environments_to_create.push("xdxtools-core");
-            }
-            if args.r {
-                environments_to_create.push("xdxtools-r");
             }
             if args.snakemake {
                 environments_to_create.push("xdxtools-snakemake");
@@ -195,7 +187,7 @@ async fn execute_env_create(
 
         if environments_to_create.is_empty() {
             return Err(EnvError::Validation(
-                "Must specify either --all, --core, --r, --snakemake, --extra, or --name".to_string(),
+                "Must specify either --all, --core, --snakemake, --extra, or --name".to_string(),
             ));
         }
     }
@@ -381,7 +373,6 @@ async fn execute_env_validate(
         // Validate all environments by checking if they exist
         let env_names = vec![
             "xdxtools-core",
-            "xdxtools-r",
             "xdxtools-snakemake",
             "xdxtools-extra",
         ];

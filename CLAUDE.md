@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**enva** is a lightweight, standalone micromamba environment manager designed for bioinformatics workflows. It's a Rust CLI tool that manages 4 pre-configured conda/micromamba environments for genomics and bioinformatics analysis. The project was extracted from xdxtools-rs with focus on minimalism and performance.
+**enva** is a lightweight, standalone micromamba environment manager designed for bioinformatics workflows. It's a Rust CLI tool that manages 3 pre-configured conda/micromamba environments for genomics and bioinformatics analysis. The project was extracted from xdxtools-rs with focus on minimalism and performance.
 
 **Key Metrics:**
 - Binary size: 5.4MB (89% smaller than xdxtools ~50MB)
@@ -111,11 +111,10 @@ The heart of the application - handles all micromamba operations:
 - `MicromambaEnvironment` struct - Environment configuration
 - `TOOL_ENVIRONMENT_MAP` - Maps tools to their default environments
 
-**4 Pre-configured Environments:**
-1. `xdxtools-core` - Core bioinformatics tools (FastQC, MultiQC, Bismark, STAR, BWA, etc.)
-2. `xdxtools-r` - R/Bioconductor packages with Qualimap
-3. `xdxtools-snakemake` - Workflow engine and dependencies
-4. `xdxtools-extra` - Advanced visualization and analysis tools
+**3 Pre-configured Environments:**
+1. `xdxtools-core` - Core bioinformatics tools (FastQC, MultiQC, Bismark, STAR, BWA, Qualimap, etc.)
+2. `xdxtools-snakemake` - Workflow engine and dependencies
+3. `xdxtools-extra` - Advanced visualization and analysis tools
 
 #### 2. **env.rs** (752 lines)
 Environment command handlers and CLI argument structures:
@@ -143,7 +142,6 @@ Error handling:
 
 YAML configuration files in `src/configs/`:
 - `xdxtools-core.yaml` - Core bioinformatics tools
-- `xdxtools-r.yaml` - R/Bioconductor packages
 - `xdxtools-snakemake.yaml` - Workflow engine
 - `xdxtools-extra.yaml` - Additional tools
 
@@ -171,7 +169,7 @@ CLI Args → main.rs → env.rs → micromamba.rs → MicromambaManager
    - MicromambaManager creates environment
 
 2. **Run Command:**
-   - User runs `enva run --name xdxtools-r --command "R --version"`
+   - User runs `enva run --name xdxtools-core --command "fastqc --version"`
    - `env_run.rs` executes command in environment
    - Uses micromamba run command
 
@@ -195,7 +193,6 @@ CLI Args → main.rs → env.rs → micromamba.rs → MicromambaManager
 Defined in `src/lib.rs`:
 ```rust
 pub const CORE_ENV_NAME: &str = "xdxtools-core";
-pub const R_ENV_NAME: &str = "xdxtools-r";
 pub const SNAKEMAKE_ENV_NAME: &str = "xdxtools-snakemake";
 pub const EXTRA_ENV_NAME: &str = "xdxtools-extra";
 ```
@@ -221,7 +218,7 @@ pub const EXTRA_ENV_NAME: &str = "xdxtools-extra";
 `TOOL_ENVIRONMENT_MAP` in micromamba.rs defines which tools belong to which environment:
 ```rust
 ("fastqc", "xdxtools-core"),
-("qualimap", "xdxtools-r"),
+("qualimap", "xdxtools-core"),
 ("snakemake", "xdxtools-snakemake"),
 ("bedtools", "xdxtools-extra"),
 ```

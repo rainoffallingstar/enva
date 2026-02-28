@@ -6,9 +6,8 @@ A lightweight, standalone micromamba environment manager for bioinformatics work
 
 - **Automatic Micromamba Installation**: Downloads and installs micromamba if not found
 - **Multi-Platform Support**: Linux, macOS, Windows
-- **4 Pre-configured Environments**:
-  - `xdxtools-core`: Core bioinformatics tools (FastQC, MultiQC, Bismark, etc.)
-  - `xdxtools-r`: R/Bioconductor packages with Qualimap
+- **3 Pre-configured Environments**:
+  - `xdxtools-core`: Core bioinformatics tools (FastQC, MultiQC, Bismark, Qualimap, etc.)
   - `xdxtools-snakemake`: Workflow engine and dependencies
   - `xdxtools-extra`: Advanced visualization and analysis tools
 
@@ -80,13 +79,13 @@ cargo build --release
 
 ```bash
 # Run command in environment
-./enva run --name xdxtools-r --command "R --version"
+./enva run --name xdxtools-core --command "fastqc --version"
 
 # Run script with arguments
-./enva run --name xdxtools-core --script my_analysis.R -- arg1 arg2
+./enva run --name xdxtools-core --script my_analysis.py -- arg1 arg2
 
 # Set environment variables
-./enva run --name xdxtools-r --command "echo $MY_VAR" --env MY_VAR=value
+./enva run --name xdxtools-core --command "echo $MY_VAR" --env MY_VAR=value
 
 # Specify working directory
 ./enva run --name xdxtools-core --script process.sh --cwd /path/to/work
@@ -98,8 +97,8 @@ cargo build --release
 # Install packages in environment
 ./enva install --name xdxtools-core --packages "fastqc,multiqc"
 
-# Install in xdxtools-r environment
-./enva install --name xdxtools-r --packages "dplyr,ggplot2"
+# Install in snakemake environment
+./enva install --name xdxtools-snakemake --packages "biopython,pyyaml"
 ```
 
 ### Validate Environments
@@ -123,7 +122,6 @@ cargo build --release
 
 Environment configurations are defined in `src/configs/`:
 - `xdxtools-core.yaml`: Core bioinformatics tools
-- `xdxtools-r.yaml`: R/Bioconductor packages
 - `xdxtools-snakemake.yaml`: Workflow engine
 - `xdxtools-extra.yaml`: Advanced tools
 
