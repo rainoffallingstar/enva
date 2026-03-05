@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "enva")]
 #[command(about = "A lightweight micromamba environment manager for bioinformatics workflows")]
-#[command(version = "0.1.0")]
+#[command(version)]
 struct Cli {
     /// Enable verbose output
     #[arg(short, long)]
