@@ -58,6 +58,9 @@ cargo build --release
 # Create with custom name
 ./enva create --name my-env
 
+# Replace an existing environment and clean caches first
+./enva create --yaml ./environments/configs/xdxtools-core.yaml --name xdxtools-core --force --clean-cache
+
 # Dry-run validation
 ./enva --dry-run create --all
 ```

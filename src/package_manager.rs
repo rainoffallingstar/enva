@@ -222,9 +222,9 @@ mod tests {
         let detector = PackageManagerDetector::new();
         assert!(detector.detected.is_none());
         assert_eq!(detector.detection_order.len(), 3);
-        assert_eq!(detector.detection_order[0], PackageManager::Conda);
+        assert_eq!(detector.detection_order[0], PackageManager::Micromamba);
         assert_eq!(detector.detection_order[1], PackageManager::Mamba);
-        assert_eq!(detector.detection_order[2], PackageManager::Micromamba);
+        assert_eq!(detector.detection_order[2], PackageManager::Conda);
     }
 
     #[test]

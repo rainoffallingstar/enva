@@ -933,7 +933,6 @@ impl MicromambaManager {
     async fn auto_copy_config_templates(&self, verbose: bool) -> Result<()> {
         let source_config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("src")
-            .join("environments")
             .join("configs");
 
         // Check if configuration directory exists and has files
@@ -999,8 +998,59 @@ impl MicromambaManager {
         Ok(output.status.success())
     }
 
+    /// Clean package caches before environment creation
+    pub async fn clean_package_cache(&self, dry_run: bool) -> Result<()> {
+        if dry_run {
+            info!("Dry-run: would clean package caches using {}", self.pm_type);
+            return Ok(());
+        }
+
+        info!("Cleaning package caches using {}...", self.pm_type);
+        let mut cmd = AsyncCommand::new(&self.pm_path);
+        cmd.arg("clean").arg("--all");
+
+        match self.pm_type {
+            PackageManager::Micromamba => {
+                cmd.arg("--yes");
+            }
+            PackageManager::Conda | PackageManager::Mamba => {
+                cmd.arg("-y");
+            }
+            PackageManager::None => {
+                return Err(EnvError::Execution(
+                    "No package manager available for cache cleaning".to_string(),
+                ));
+            }
+        }
+
+        cmd.stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+
+        self.apply_env_to_command(&mut cmd);
+
+        let output = cmd.output().await.map_err(|e| {
+            EnvError::Execution(format!("Failed to clean package caches: {}", e))
+        })?;
+
+        if !output.status.success() {
+            return Err(EnvError::Execution(format!(
+                "Failed to clean package caches: exit code {:?}",
+                output.status.code()
+            )));
+        }
+
+        info!("Package caches cleaned successfully");
+        Ok(())
+    }
+
     /// Create environment from YAML file
-    pub async fn create_environment(&self, yaml_file: &Path, dry_run: bool) -> Result<()> {
+    pub async fn create_environment(
+        &self,
+        env_name: &str,
+        yaml_file: &Path,
+        dry_run: bool,
+        force: bool,
+    ) -> Result<()> {
         let _lock = self.creation_lock.lock().await;
 
         info!("create_environment called for {:?}", yaml_file);
@@ -1015,7 +1065,23 @@ impl MicromambaManager {
             return Ok(());
         }
 
-        // Validate YAML before creating
+        if self.environment_exists(env_name).await? {
+            if force {
+                info!(
+                    "Environment {} already exists; removing it before recreation",
+                    env_name
+                );
+                self.remove_environment(env_name).await?;
+            } else {
+                let error_msg = format!(
+                    "Environment {} already exists. Re-run with --force to replace it.",
+                    env_name
+                );
+                error!("{}", error_msg);
+                return Err(EnvError::Execution(error_msg));
+            }
+        }
+
         pb.set_message("Validating YAML configuration...");
         info!("About to validate YAML for {:?}", yaml_file);
         let _validation = self.validate_yaml(yaml_file).await?;
@@ -1028,16 +1094,16 @@ impl MicromambaManager {
             .arg("create")
             .arg("-f")
             .arg(yaml_file)
+            .arg("-n")
+            .arg(env_name)
             .arg("-y")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        // Apply environment variables
         self.apply_env_to_command(&mut cmd);
 
         info!("Command built, executing...");
 
-        // 清除进度条以避免输出混合
         pb.finish_and_clear();
 
         let output = cmd
@@ -1045,7 +1111,6 @@ impl MicromambaManager {
             .await
             .map_err(|e| EnvError::Execution(format!("Failed to execute micromamba: {}", e)))?;
 
-        // Display stdout and stderr
         if !output.stdout.is_empty() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             print!("{}", stdout);
@@ -1056,12 +1121,10 @@ impl MicromambaManager {
         }
 
         if !output.status.success() {
-            // Check for specific error: "Non-conda folder exists at prefix"
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("Non-conda folder exists at prefix") {
                 let error_msg = format!(
-                    "Failed to create environment: Environment directory already exists but is not a valid conda environment. \
-Please remove the existing directory and try again, or use a different environment name."
+                    "Failed to create environment: Environment directory already exists but is not a valid conda environment. Please remove the existing directory and try again, or use a different environment name."
                 );
                 error!("{}", error_msg);
                 return Err(EnvError::Execution(error_msg));
@@ -1645,13 +1708,27 @@ fn parse_conda_env_list(output: &[u8]) -> Result<Vec<CondaEnvironment>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::Mutex;
+
+    fn build_test_manager(config_dir: &Path) -> MicromambaManager {
+        MicromambaManager {
+            pm_path: PathBuf::from("micromamba"),
+            pm_type: PackageManager::Micromamba,
+            environments: HashMap::new(),
+            config_dir: config_dir.to_path_buf(),
+            version_config: VersionConfig::default(),
+            creation_lock: Arc::new(Mutex::new(())),
+        }
+    }
 
     #[tokio::test]
     async fn test_validate_yaml() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = tempdir().unwrap();
         let yaml_file = temp_dir.path().join("test.yaml");
 
-        // Create a simple test YAML
         let yaml_content = r#"
 name: test-env
 channels:
@@ -1662,10 +1739,7 @@ dependencies:
 "#;
         fs::write(&yaml_file, yaml_content).unwrap();
 
-        let manager = MicromambaManager::with_config_dir(temp_dir.path())
-            .await
-            .unwrap();
-
+        let manager = build_test_manager(temp_dir.path());
         let result = manager.validate_yaml(&yaml_file).await.unwrap();
 
         assert!(result.validation.syntax_valid);
@@ -1675,14 +1749,15 @@ dependencies:
 
     #[tokio::test]
     async fn test_environment_list() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let mut manager = build_test_manager(temp_dir.path());
 
-        let manager = MicromambaManager::with_config_dir(temp_dir.path())
-            .await
-            .unwrap();
+        manager.initialize_environments(false).await.unwrap();
         let envs = manager.list_environments().await.unwrap();
 
-        // Should have at least the 4 core environments defined
-        assert!(envs.len() >= 4);
+        assert_eq!(envs.len(), 3);
+        assert!(envs.iter().any(|env| env.name == "xdxtools-core"));
+        assert!(envs.iter().any(|env| env.name == "xdxtools-snakemake"));
+        assert!(envs.iter().any(|env| env.name == "xdxtools-extra"));
     }
 }

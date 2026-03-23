@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn test_validate_args_both_command_and_script() {
         let args = EnvRunArgs {
-            name: "test-env".to_string(),
+            name: Some("test-env".to_string()),
             command: Some("echo test".to_string()),
             script: Some(PathBuf::from("test.R")),
             args: vec![],
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn test_validate_args_neither_command_nor_script() {
         let args = EnvRunArgs {
-            name: "test-env".to_string(),
+            name: Some("test-env".to_string()),
             command: None,
             script: None,
             args: vec![],
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn test_validate_args_invalid_env_format() {
         let args = EnvRunArgs {
-            name: "test-env".to_string(),
+            name: Some("test-env".to_string()),
             command: Some("echo test".to_string()),
             script: None,
             args: vec![],
@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn test_validate_args_valid() {
         let args = EnvRunArgs {
-            name: "test-env".to_string(),
+            name: Some("test-env".to_string()),
             command: Some("echo test".to_string()),
             script: None,
             args: vec![],

@@ -52,6 +52,14 @@ pub struct EnvCreateArgs {
     /// Environment name (for custom environments)
     #[arg(long)]
     pub name: Option<String>,
+
+    /// Replace an existing environment before recreating it
+    #[arg(long)]
+    pub force: bool,
+
+    /// Clean conda package caches before creating environments
+    #[arg(long)]
+    pub clean_cache: bool,
 }
 
 /// Environment validation arguments
@@ -268,6 +276,11 @@ async fn execute_env_create(
     let mut success_count = 0;
     let mut failed_count = 0;
 
+    if args.clean_cache {
+        let manager = micromamba_manager.lock().await;
+        manager.clean_package_cache(dry_run).await?;
+    }
+
     for env_name in environments_to_create {
         // Lock manager for this iteration
         let manager = micromamba_manager.lock().await;
@@ -310,7 +323,7 @@ async fn execute_env_create(
         };
 
         match manager
-            .create_environment(&yaml_file, dry_run)
+            .create_environment(env_name, &yaml_file, dry_run, args.force)
             .await
         {
             Ok(_) => {
