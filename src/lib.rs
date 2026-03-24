@@ -1,15 +1,15 @@
 //! enva - A lightweight micromamba environment manager for bioinformatics workflows
 
-pub mod error;
-pub mod package_manager;
-pub mod micromamba;
 pub mod env;
 pub mod env_run;
+pub mod error;
+pub mod micromamba;
+pub mod package_manager;
 
 // Re-export commonly used types
+pub use env::{execute_env_command, EnvArgs};
 pub use error::{EnvError, Result};
-pub use env::{EnvArgs, execute_env_command};
-pub use package_manager::{PackageManager, PackageManagerDetector, get_global_detector};
+pub use package_manager::{get_global_detector, PackageManager, PackageManagerDetector};
 
 // Constants for the 3 core environments
 pub const CORE_ENV_NAME: &str = "xdxtools-core";
@@ -31,10 +31,12 @@ pub async fn initialize() -> Result<()> {
 
 /// Display startup banner
 pub fn display_startup_banner() {
-    println!(r#"#========================================#
+    println!(
+        r#"#========================================#
 #       enva v0.1.0                        #
 #  Micromamba Environment Manager          #
 #  For Bioinformatics Workflows            #
 #========================================#
-"#);
+"#
+    );
 }

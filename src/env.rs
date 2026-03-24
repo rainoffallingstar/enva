@@ -375,7 +375,7 @@ async fn execute_env_create(
 }
 
 /// Execute environment list
-async fn execute_env_list(args: EnvListArgs, _verbose: bool, json: bool) -> Result<()> {
+async fn execute_env_list(_args: EnvListArgs, _verbose: bool, json: bool) -> Result<()> {
     info!("Listing conda environments...");
 
     // 直接显示所有 conda 环境

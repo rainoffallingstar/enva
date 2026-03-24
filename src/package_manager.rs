@@ -1,21 +1,25 @@
 //! Package manager detection and abstraction
 //!
-//! Auto-detects and prioritizes: conda → mamba → micromamba
-//! - conda: Most compatible, slowest
-//! - mamba: 2-3x faster than conda
+//! Auto-detects and prioritizes: micromamba → mamba → conda
 //! - micromamba: 3-5x faster, lightweight
+//! - mamba: 2-3x faster than conda
+//! - conda: Most compatible, slowest
 
-use crate::error::{Result, EnvError};
+use crate::error::Result;
+use clap::ValueEnum;
+use std::collections::HashMap;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use tracing::{debug, info, warn};
 use which::which;
 
 /// Package manager type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum PackageManager {
     Conda,
     Mamba,
     Micromamba,
+    #[value(skip)]
     None,
 }
 
@@ -27,6 +31,16 @@ impl PackageManager {
             PackageManager::Mamba => "mamba",
             PackageManager::Micromamba => "micromamba",
             PackageManager::None => "",
+        }
+    }
+
+    /// Parse package manager name from string
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value.to_lowercase().as_str() {
+            "conda" => Some(PackageManager::Conda),
+            "mamba" => Some(PackageManager::Mamba),
+            "micromamba" => Some(PackageManager::Micromamba),
+            _ => None,
         }
     }
 
@@ -50,6 +64,11 @@ impl std::fmt::Display for PackageManager {
             PackageManager::None => write!(f, "none"),
         }
     }
+}
+
+fn availability_cache() -> &'static Mutex<HashMap<PackageManager, bool>> {
+    static AVAILABILITY_CACHE: OnceLock<Mutex<HashMap<PackageManager, bool>>> = OnceLock::new();
+    AVAILABILITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Detector with priority-based auto-detection
@@ -79,18 +98,55 @@ impl PackageManagerDetector {
         }
     }
 
+    fn prioritized_order(&self, preferred: Option<PackageManager>) -> Vec<PackageManager> {
+        let mut order = self.detection_order.clone();
+        if let Some(pm) = preferred {
+            if let Some(index) = order.iter().position(|candidate| *candidate == pm) {
+                order.remove(index);
+                order.insert(0, pm);
+            }
+        }
+        order
+    }
+
+    fn preferred_manager_from_env() -> Option<PackageManager> {
+        std::env::var("ENVA_PACKAGE_MANAGER")
+            .ok()
+            .as_deref()
+            .and_then(PackageManager::from_name)
+    }
+
+    /// List available package managers using the detector's default order
+    pub fn available_managers(&self) -> Vec<PackageManager> {
+        self.available_managers_with_preference(None)
+    }
+
+    /// List available package managers, moving the preferred manager to the front when present
+    pub fn available_managers_with_preference(
+        &self,
+        preferred: Option<PackageManager>,
+    ) -> Vec<PackageManager> {
+        self.prioritized_order(preferred)
+            .into_iter()
+            .filter(|pm| self.check_available(pm))
+            .collect()
+    }
+
+    /// List available package managers while honoring ENVA_PACKAGE_MANAGER as a first-choice hint
+    pub fn available_managers_with_env_override(&self) -> Vec<PackageManager> {
+        self.available_managers_with_preference(Self::preferred_manager_from_env())
+    }
+
     /// Detect available PM with priority
     pub fn detect(&mut self) -> Result<PackageManager> {
         if let Some(pm) = self.detected {
             return Ok(pm);
         }
 
-        for pm in &self.detection_order {
-            if self.check_available(pm) {
-                info!("✓ Detected package manager: {}", pm);
-                self.detected = Some(*pm);
-                return Ok(*pm);
-            }
+        if let Some(pm) = self.available_managers().first().copied() {
+            info!("✓ Detected package manager: {}", pm);
+            self.detected = Some(pm);
+            return Ok(pm);
         }
 
         warn!("⚠ No package manager found (conda/mamba/micromamba)");
@@ -100,24 +156,43 @@ impl PackageManagerDetector {
 
     /// Check if PM is available and functional
     fn check_available(&self, pm: &PackageManager) -> bool {
-        let cmd = pm.command();
-
-        // Check in PATH
-        match which(cmd) {
-            Ok(_) => {
-                // Verify it works
-                if let Ok(output) = Command::new(cmd).arg("--version").output() {
-                    if output.status.success() {
-                        debug!("{} is available", cmd);
-                        return true;
-                    }
-                }
-            }
-            Err(_) => {
-                debug!("{} not found in PATH", cmd);
+        if let Ok(cache) = availability_cache().lock() {
+            if let Some(available) = cache.get(pm) {
+                return *available;
             }
         }
-        false
+
+        let cmd = pm.command();
+        let available = match which(cmd) {
+            Ok(path) => match Command::new(&path).arg("--version").output() {
+                Ok(output) if output.status.success() => {
+                    debug!("{} is available at {}", cmd, path.display());
+                    true
+                }
+                Ok(output) => {
+                    debug!(
+                        "{} failed health check with status {:?}",
+                        cmd,
+                        output.status.code()
+                    );
+                    false
+                }
+                Err(error) => {
+                    debug!("{} failed health check: {}", cmd, error);
+                    false
+                }
+            },
+            Err(_) => {
+                debug!("{} not found in PATH", cmd);
+                false
+            }
+        };
+
+        if let Ok(mut cache) = availability_cache().lock() {
+            cache.insert(*pm, available);
+        }
+
+        available
     }
 
     /// Get detected PM
@@ -135,7 +210,6 @@ impl PackageManagerDetector {
 
     /// Detect with env var override
     pub fn detect_with_env_override(&mut self) -> Result<PackageManager> {
-        // Check ENVA_PACKAGE_MANAGER env var
         if let Ok(env_pm) = std::env::var("ENVA_PACKAGE_MANAGER") {
             match env_pm.to_lowercase().as_str() {
                 "conda" => {
@@ -166,18 +240,20 @@ impl PackageManagerDetector {
             return Ok(pm);
         }
 
-        warn!("Package manager '{}' not found, falling back to auto-detection", pm);
+        warn!(
+            "Package manager '{}' not found, falling back to auto-detection",
+            pm
+        );
         self.detect()
     }
 }
 
 /// Global detector instance
-static GLOBAL_DETECTOR: std::sync::OnceLock<std::sync::Mutex<PackageManagerDetector>> =
-    std::sync::OnceLock::new();
+static GLOBAL_DETECTOR: OnceLock<Mutex<PackageManagerDetector>> = OnceLock::new();
 
 /// Get global detector
-pub fn get_global_detector() -> &'static std::sync::Mutex<PackageManagerDetector> {
-    GLOBAL_DETECTOR.get_or_init(|| std::sync::Mutex::new(PackageManagerDetector::new()))
+pub fn get_global_detector() -> &'static Mutex<PackageManagerDetector> {
+    GLOBAL_DETECTOR.get_or_init(|| Mutex::new(PackageManagerDetector::new()))
 }
 
 #[cfg(test)]
@@ -241,18 +317,46 @@ mod tests {
     #[test]
     fn test_get_run_command_no_detection() {
         let detector = PackageManagerDetector::new();
-        // Without detection, should return env_name as-is
         assert_eq!(detector.get_run_command("test_env"), "test_env");
     }
 
     #[test]
     fn test_get_run_command_with_detection() {
         let mut detector = PackageManagerDetector::new();
-        // Simulate detection by setting detected field directly
         detector.detected = Some(PackageManager::Mamba);
         assert_eq!(
             detector.get_run_command("test_env"),
             "mamba run -n test_env"
         );
+    }
+
+    #[test]
+    fn test_prioritized_order_moves_preference_to_front() {
+        let detector = PackageManagerDetector::new();
+        assert_eq!(
+            detector.prioritized_order(Some(PackageManager::Conda)),
+            vec![
+                PackageManager::Conda,
+                PackageManager::Micromamba,
+                PackageManager::Mamba,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_from_name() {
+        assert_eq!(
+            PackageManager::from_name("conda"),
+            Some(PackageManager::Conda)
+        );
+        assert_eq!(
+            PackageManager::from_name("MAMBA"),
+            Some(PackageManager::Mamba)
+        );
+        assert_eq!(
+            PackageManager::from_name("micromamba"),
+            Some(PackageManager::Micromamba)
+        );
+        assert_eq!(PackageManager::from_name("unknown"), None);
     }
 }

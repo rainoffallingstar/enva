@@ -15,7 +15,6 @@
 use crate::env::OutputMode;
 use crate::error::{EnvError, Result};
 use crate::package_manager::{PackageManager, PackageManagerDetector};
-use async_trait::async_trait;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest;
 use serde::{Deserialize, Serialize};
@@ -26,7 +25,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::process::Command as AsyncCommand;
 use tokio::sync::Mutex;
@@ -39,6 +38,10 @@ static GLOBAL_MANAGER: LazyLock<Mutex<Option<MicromambaManager>>> =
 
 /// Track whether global manager has been initialized (to control logging)
 static GLOBAL_INITIALIZED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
+
+/// Shared runtime managers for fast env resolution paths
+static RUNTIME_MANAGER_CACHE: LazyLock<StdMutex<HashMap<PackageManager, MicromambaManager>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 /// Tool to environment mapping (updated for micromamba)
 pub const TOOL_ENVIRONMENT_MAP: &[(&str, &str)] = &[
@@ -174,6 +177,8 @@ pub struct MicromambaManager {
     version_config: VersionConfig,
     /// Mutex for environment creation to prevent race conditions
     creation_lock: Arc<Mutex<()>>,
+    /// Cached environment prefixes for this package manager instance
+    env_list_cache: Arc<StdMutex<Option<Vec<PathBuf>>>>,
 }
 
 impl Clone for MicromambaManager {
@@ -186,6 +191,7 @@ impl Clone for MicromambaManager {
             version_config: self.version_config.clone(),
             // Reuse the same lock across clones to maintain synchronization
             creation_lock: Arc::clone(&self.creation_lock),
+            env_list_cache: Arc::clone(&self.env_list_cache),
         }
     }
 }
@@ -237,23 +243,18 @@ fn normalize_and_validate_path(path: &Path) -> Result<PathBuf> {
 
 impl MicromambaManager {
     /// Create new manager with automatic package manager detection
-    /// Detects and uses: conda → mamba → micromamba (in priority order)
+    /// Detects and uses: micromamba → mamba → conda (in priority order)
     pub async fn new() -> Result<Self> {
-        // 1. Detect package manager with priority
         let mut detector = PackageManagerDetector::new();
         let pm_type = detector.detect_with_env_override()?;
+        Self::new_with_package_manager(pm_type).await
+    }
 
-        // 2. Get PM path based on detection
+    async fn build_manager(pm_type: PackageManager, initialize_envs: bool) -> Result<Self> {
         let pm_path = match pm_type {
-            PackageManager::Conda | PackageManager::Mamba => {
-                // conda/mamba usually in PATH
-                which(pm_type.command())
-                    .map_err(|_| EnvError::Config(format!("{} not found in PATH", pm_type)))?
-            }
-            PackageManager::Micromamba => {
-                // micromamba might need to be downloaded
-                Self::find_or_install_micromamba().await?
-            }
+            PackageManager::Conda | PackageManager::Mamba => which(pm_type.command())
+                .map_err(|_| EnvError::Config(format!("{} not found in PATH", pm_type)))?,
+            PackageManager::Micromamba => Self::find_or_install_micromamba().await?,
             PackageManager::None => {
                 return Err(EnvError::Config(
                     "No package manager found (conda/mamba/micromamba)".to_string(),
@@ -263,9 +264,7 @@ impl MicromambaManager {
 
         info!("✓ Package manager: {} ({})", pm_type, pm_path.display());
 
-        // 3. Initialize other fields
         let config_dir = Self::get_cache_config_dir()?;
-
         let mut manager = Self {
             pm_path,
             pm_type,
@@ -273,10 +272,45 @@ impl MicromambaManager {
             config_dir,
             version_config: VersionConfig::default(),
             creation_lock: Arc::new(Mutex::new(())),
+            env_list_cache: Arc::new(StdMutex::new(None)),
         };
 
-        manager.initialize_environments(true).await?;
+        if initialize_envs {
+            manager.initialize_environments(false).await?;
+        }
+
         Ok(manager)
+    }
+
+    /// Create new manager bound to a specific package manager
+    pub async fn new_with_package_manager(pm_type: PackageManager) -> Result<Self> {
+        Self::build_manager(pm_type, true).await
+    }
+
+    /// Create a runtime-only manager that skips environment template initialization
+    pub async fn new_runtime_with_package_manager(pm_type: PackageManager) -> Result<Self> {
+        if let Ok(cache) = RUNTIME_MANAGER_CACHE.lock() {
+            if let Some(manager) = cache.get(&pm_type) {
+                return Ok(manager.clone());
+            }
+        }
+
+        let manager = Self::build_manager(pm_type, false).await?;
+
+        if let Ok(mut cache) = RUNTIME_MANAGER_CACHE.lock() {
+            let cached = cache.entry(pm_type).or_insert_with(|| manager.clone());
+            return Ok(cached.clone());
+        }
+
+        Ok(manager)
+    }
+
+    fn invalidate_runtime_manager_cache(pm_type: PackageManager) {
+        if let Ok(cache) = RUNTIME_MANAGER_CACHE.lock() {
+            if let Some(manager) = cache.get(&pm_type) {
+                manager.invalidate_environment_list_cache();
+            }
+        }
     }
 
     /// Get detected package manager
@@ -333,6 +367,7 @@ impl MicromambaManager {
             config_dir,
             version_config: VersionConfig::default(),
             creation_lock: Arc::new(Mutex::new(())),
+            env_list_cache: Arc::new(StdMutex::new(None)),
         };
 
         manager.initialize_environments(true).await?;
@@ -354,6 +389,7 @@ impl MicromambaManager {
             config_dir,
             version_config,
             creation_lock: Arc::new(Mutex::new(())),
+            env_list_cache: Arc::new(StdMutex::new(None)),
         };
 
         manager.initialize_environments(true).await?;
@@ -365,17 +401,22 @@ impl MicromambaManager {
         &self.config_dir
     }
 
-    /// Build environment variables for micromamba subprocess execution
+    /// Build environment variables for package-manager subprocess execution
     fn build_env_vars(&self) -> HashMap<String, String> {
         let mut env_vars = HashMap::new();
 
-        // Get package manager bin directory (not parent - we need the bin directory itself in PATH)
-        let pm_dir = self.pm_path.clone();
+        if self.pm_type != PackageManager::Micromamba {
+            return env_vars;
+        }
 
-        // Calculate MAMBA_ROOT_PREFIX (parent of micromamba binary or dedicated prefix)
+        let pm_dir = self
+            .pm_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.pm_path.clone());
+
         let mamba_root = self.get_mamba_root_prefix();
 
-        // Set LD_LIBRARY_PATH
         let lib_dir = pm_dir.join("lib");
         let existing_ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
         let new_ld_path = if existing_ld_path.is_empty() {
@@ -385,25 +426,13 @@ impl MicromambaManager {
         };
         env_vars.insert("LD_LIBRARY_PATH".to_string(), new_ld_path);
 
-        // Set PATH - put micromamba's bin directory FIRST to ensure it's used instead of conda
         let existing_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{}", pm_dir.to_string_lossy(), existing_path);
         env_vars.insert("PATH".to_string(), new_path);
 
-        // Also ensure we explicitly set the micromamba path to avoid PATH resolution issues
-        // This is critical when conda is in PATH
-
-        // Note: Don't set MAMBA_ROOT_PREFIX to avoid overriding micromamba's default configuration
-        // Let micromamba use its default base environment location
-
-        // Override _CONDA_ROOT to ensure micromamba uses the correct environment path
-        // This is needed when user has conda environment activated (sets _CONDA_ROOT)
-        // and micromamba is installed in a different location
         let mamba_root_str = mamba_root.to_string_lossy().to_string();
         env_vars.insert("_CONDA_ROOT".to_string(), mamba_root_str.clone());
         env_vars.insert("MAMBA_ROOT_PREFIX".to_string(), mamba_root_str.clone());
-
-        // Also clear CONDA_PREFIX which might interfere
         env_vars.insert("CONDA_PREFIX".to_string(), mamba_root_str.clone());
         env_vars.insert("CONDA_DEFAULT_ENV".to_string(), "base".to_string());
 
@@ -530,7 +559,7 @@ impl MicromambaManager {
     async fn install_micromamba() -> Result<PathBuf> {
         // Determine target architecture
         let arch = std::env::consts::ARCH;
-        let target = match arch {
+        let _target = match arch {
             "x86_64" => "x64",
             "aarch64" => "aarch64",
             _ => {
@@ -641,14 +670,12 @@ impl MicromambaManager {
                             continue;
                         }
 
-                        let total_size = match response.content_length() {
+                        match response.content_length() {
                             Some(size) => {
                                 pb.set_length(size);
-                                size
                             }
                             None => {
                                 warn!("Could not determine content length from {}", source_name);
-                                0
                             }
                         };
 
@@ -976,22 +1003,6 @@ impl MicromambaManager {
         Ok(())
     }
 
-    /// Validate micromamba installation
-    async fn validate_micromamba(&self) -> Result<bool> {
-        let mut cmd = AsyncCommand::new(&self.pm_path);
-        cmd.arg("--version");
-
-        // Apply environment variables
-        self.apply_env_to_command(&mut cmd);
-
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| EnvError::Execution(format!("Failed to execute micromamba: {}", e)))?;
-
-        Ok(output.status.success())
-    }
-
     fn summary_spinner(message: impl Into<String>) -> Result<ProgressBar> {
         let pb = ProgressBar::new_spinner();
         let style = ProgressStyle::default_spinner()
@@ -1225,60 +1236,38 @@ impl MicromambaManager {
             println!("✓ Environment {} created", env_name);
         }
 
+        self.invalidate_environment_list_cache();
+        Self::invalidate_runtime_manager_cache(self.pm_type);
         info!("Environment created successfully from {:?}", yaml_file);
         Ok(())
     }
 
-    /// Run command in environment
-    pub async fn run_in_environment(&self, env_name: &str, command: &str) -> Result<Output> {
-        let mut cmd = AsyncCommand::new(&self.pm_path);
-        cmd.arg("run")
-            .arg("-n")
-            .arg(env_name)
-            .arg("--no-capture-output")
-            .arg(command);
-
-        // Apply environment variables
-        self.apply_env_to_command(&mut cmd);
-
-        cmd.output().await.map_err(|e| {
-            EnvError::Execution(format!("Failed to run command in environment: {}", e))
-        })
-    }
-
-    /// Run command in environment with extended options
-    pub async fn run_in_environment_extended(
+    async fn run_with_target_extended(
         &self,
-        env_name: &str,
+        target_flag: &str,
+        target: &str,
         command: &str,
         env_vars: &[String],
         cwd: &Path,
         capture_output: bool,
     ) -> Result<()> {
-        // Get the environment variables to set
-        let micromamba_env = self.build_env_vars();
-
-        // Build command as a single shell command
-        let mut env_cmd = String::new();
-        for (key, value) in &micromamba_env {
-            env_cmd.push_str(&format!("export {}={}; ", key, value));
-        }
-        // Use micromamba directly (not through bash -c which causes issues with --no-capture-output)
-        env_cmd.push_str(&format!(
-            "{} run -n {} {}",
-            self.pm_path.to_string_lossy(),
-            env_name,
-            command
-        ));
-
-        // Use bash -c to execute with our environment
-        let mut cmd = AsyncCommand::new("bash");
-        cmd.arg("-c").arg(&env_cmd);
-
-        // Set working directory
+        let mut cmd = AsyncCommand::new(&self.pm_path);
+        cmd.arg("run")
+            .arg(target_flag)
+            .arg(target)
+            .arg("bash")
+            .arg("-lc")
+            .arg(command);
         cmd.current_dir(cwd);
 
-        // Set output configuration
+        self.apply_env_to_command(&mut cmd);
+        for env_pair in env_vars {
+            let (key, value) = env_pair.split_once('=').ok_or_else(|| {
+                EnvError::Validation(format!("Invalid environment variable format: {}", env_pair))
+            })?;
+            cmd.env(key, value);
+        }
+
         if capture_output {
             cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
@@ -1287,34 +1276,24 @@ impl MicromambaManager {
                 .stderr(std::process::Stdio::inherit());
         }
 
-        // Execute command
         let output =
             if capture_output {
-                // Capture output to display it
                 let output = cmd.output().await.map_err(|e| {
                     EnvError::Execution(format!("Failed to execute command: {}", e))
                 })?;
 
-                // Display stdout
                 if !output.stdout.is_empty() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    print!("{}", stdout);
+                    print!("{}", String::from_utf8_lossy(&output.stdout));
                 }
-
-                // Display stderr
                 if !output.stderr.is_empty() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    eprint!("{}", stderr);
+                    eprint!("{}", String::from_utf8_lossy(&output.stderr));
                 }
 
                 output
             } else {
-                // Don't capture, let it inherit (for real-time output)
                 let status = cmd.status().await.map_err(|e| {
                     EnvError::Execution(format!("Failed to execute command: {}", e))
                 })?;
-
-                // Create a mock output for status checking
                 std::process::Output {
                     status,
                     stdout: Vec::new(),
@@ -1332,12 +1311,68 @@ impl MicromambaManager {
         Ok(())
     }
 
-    /// Check if environment exists
-    pub async fn environment_exists(&self, env_name: &str) -> Result<bool> {
+    /// Run command in environment
+    pub async fn run_in_environment(&self, env_name: &str, command: &str) -> Result<Output> {
+        let mut cmd = AsyncCommand::new(&self.pm_path);
+        cmd.arg("run")
+            .arg("-n")
+            .arg(env_name)
+            .arg("--")
+            .arg("bash")
+            .arg("-lc")
+            .arg(command);
+
+        self.apply_env_to_command(&mut cmd);
+
+        cmd.output().await.map_err(|e| {
+            EnvError::Execution(format!("Failed to run command in environment: {}", e))
+        })
+    }
+
+    /// Run command in environment with extended options
+    pub async fn run_in_environment_extended(
+        &self,
+        env_name: &str,
+        command: &str,
+        env_vars: &[String],
+        cwd: &Path,
+        capture_output: bool,
+    ) -> Result<()> {
+        self.run_with_target_extended("-n", env_name, command, env_vars, cwd, capture_output)
+            .await
+    }
+
+    /// Run command using an explicit environment prefix
+    pub async fn run_in_environment_by_prefix_extended(
+        &self,
+        prefix: &Path,
+        command: &str,
+        env_vars: &[String],
+        cwd: &Path,
+        capture_output: bool,
+    ) -> Result<()> {
+        let prefix = prefix.to_string_lossy().to_string();
+        self.run_with_target_extended("-p", &prefix, command, env_vars, cwd, capture_output)
+            .await
+    }
+
+    fn invalidate_environment_list_cache(&self) {
+        if let Ok(mut cache) = self.env_list_cache.lock() {
+            *cache = None;
+        }
+    }
+
+    /// List environment prefixes visible to the configured package manager
+    pub async fn list_environment_prefixes(&self) -> Result<Vec<PathBuf>> {
+        if let Ok(cache) = self.env_list_cache.lock() {
+            if let Some(envs) = cache.as_ref() {
+                return Ok(envs.clone());
+            }
+        }
+
         let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("env").arg("list").arg("--json");
 
-        // Apply environment variables
         self.apply_env_to_command(&mut cmd);
 
         let output = cmd
@@ -1353,26 +1388,59 @@ impl MicromambaManager {
             )));
         }
 
-        let json_str = String::from_utf8_lossy(&output.stdout);
-
-        // Parse the JSON to check if environment exists
         #[derive(Deserialize)]
         struct EnvList {
             envs: Vec<String>,
         }
 
+        let json_str = String::from_utf8_lossy(&output.stdout);
         let envs: EnvList = serde_json::from_str(&json_str).map_err(|e| {
             EnvError::Validation(format!("Failed to parse environment list: {}", e))
         })?;
+        let envs: Vec<PathBuf> = envs.envs.into_iter().map(PathBuf::from).collect();
 
-        // Extract environment name from path and compare
-        Ok(envs.envs.iter().any(|env| {
-            Path::new(env)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name == env_name)
-                .unwrap_or(false)
-        }))
+        if let Ok(mut cache) = self.env_list_cache.lock() {
+            *cache = Some(envs.clone());
+        }
+
+        Ok(envs)
+    }
+
+    fn get_base_environment_prefix(&self) -> PathBuf {
+        match self.pm_type {
+            PackageManager::Micromamba => self.get_mamba_root_prefix(),
+            PackageManager::Conda | PackageManager::Mamba => self
+                .pm_path
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::var("CONDA_PREFIX").ok().map(PathBuf::from))
+                .unwrap_or_else(|| self.get_mamba_root_prefix()),
+            PackageManager::None => self.get_mamba_root_prefix(),
+        }
+    }
+
+    fn environment_name_matches(&self, env: &Path, env_name: &str) -> bool {
+        env.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name == env_name)
+            .unwrap_or(false)
+            || (env_name == "base" && env == self.get_base_environment_prefix())
+    }
+
+    /// Find all matching environment prefixes for a given environment name
+    pub async fn find_environment_prefixes(&self, env_name: &str) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .list_environment_prefixes()
+            .await?
+            .into_iter()
+            .filter(|env| self.environment_name_matches(env, env_name))
+            .collect())
+    }
+
+    /// Check if environment exists
+    pub async fn environment_exists(&self, env_name: &str) -> Result<bool> {
+        Ok(!self.find_environment_prefixes(env_name).await?.is_empty())
     }
 
     /// Remove environment
@@ -1435,6 +1503,8 @@ impl MicromambaManager {
             println!("✓ Removed environment {}", env_name);
         }
 
+        self.invalidate_environment_list_cache();
+        Self::invalidate_runtime_manager_cache(self.pm_type);
         info!("Environment {} removed successfully", env_name);
         Ok(())
     }
@@ -1846,6 +1916,7 @@ mod tests {
             config_dir: config_dir.to_path_buf(),
             version_config: VersionConfig::default(),
             creation_lock: Arc::new(Mutex::new(())),
+            env_list_cache: Arc::new(StdMutex::new(None)),
         }
     }
 

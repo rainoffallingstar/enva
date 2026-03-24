@@ -1,7 +1,7 @@
 //! enva - A lightweight micromamba environment manager for bioinformatics workflows
 
-use clap::{Parser, Subcommand};
-use enva::env::{EnvCommand, execute_env_command};
+use clap::Parser;
+use enva::env::{execute_env_command, EnvCommand};
 use std::path::PathBuf;
 
 /// CLI arguments for enva

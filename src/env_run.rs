@@ -1,21 +1,30 @@
 //! Environment run command
 
-use crate::error::{Result, EnvError};
+use crate::error::{EnvError, Result};
 use crate::micromamba::MicromambaManager;
-use crate::package_manager::PackageManager;
+use crate::package_manager::{PackageManager, PackageManagerDetector};
 use clap::Args;
-use std::path::PathBuf;
-use tracing::{error, info};
+use std::path::{Path, PathBuf};
+use tracing::{error, info, warn};
 
 /// Environment run arguments
 /// Supports both positional and flag-based syntax:
 /// - Positional: enva run <env> <cmd>
 /// - Flags: enva run --name <env> --command "<cmd>"
+/// - Explicit prefix: enva run --prefix /path/to/env -- <cmd>
 #[derive(Debug, Clone, Args)]
 pub struct EnvRunArgs {
     /// Environment name (can be positional or via --name/-n)
     #[arg(short, long, value_name = "ENV")]
     pub name: Option<String>,
+
+    /// Explicit package manager to use for environment lookup and execution
+    #[arg(long, value_enum)]
+    pub pm: Option<PackageManager>,
+
+    /// Explicit environment prefix path; bypasses name-based discovery when provided
+    #[arg(long, value_name = "PREFIX")]
+    pub prefix: Option<PathBuf>,
 
     /// Command to execute (via --command flag only)
     #[arg(long, value_name = "CMD")]
@@ -45,13 +54,11 @@ pub struct EnvRunArgs {
 impl EnvRunArgs {
     /// Get environment name (resolve from either --name flag or first positional arg)
     pub fn get_env_name(&self) -> Result<String> {
-        // Priority: --name flag > first positional arg
         if let Some(ref name) = self.name {
             return Ok(name.clone());
         }
 
-        // Try to get from first positional arg
-        if !self.args.is_empty() {
+        if !self.args.is_empty() && self.prefix.is_none() {
             return Ok(self.args[0].clone());
         }
 
@@ -60,16 +67,20 @@ impl EnvRunArgs {
 
     /// Get command (resolve from either --command flag or positional args)
     pub fn get_command(&self) -> Result<String> {
-        // Priority: --command flag > positional args (skip env_name)
         if let Some(ref cmd) = self.command {
             return Ok(cmd.clone());
         }
 
-        // Build from positional args (skip first if it's env name)
-        let start_idx = if self.name.is_some() { 0 } else { 1 };
-        let args: Vec<&str> = self.args.iter()
+        let start_idx = if self.name.is_some() || self.prefix.is_some() {
+            0
+        } else {
+            1
+        };
+        let args: Vec<&str> = self
+            .args
+            .iter()
             .skip(start_idx)
-            .map(|s| s.as_str())
+            .map(|value| value.as_str())
             .collect();
 
         if args.is_empty() {
@@ -80,62 +91,224 @@ impl EnvRunArgs {
     }
 }
 
-/// Execute environment run command
-pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
-    // Parse environment name and command
-    let env_name = args.get_env_name()?;
-    let full_command = if let Some(ref script) = args.script {
-        format!("Rscript {}", script.display())
-    } else {
-        args.get_command()?
-    };
+#[derive(Clone)]
+struct ResolvedEnvironment {
+    manager: MicromambaManager,
+    package_manager: PackageManager,
+    prefix: PathBuf,
+    requested_name: Option<String>,
+}
 
-    if verbose {
-        info!("Executing in environment '{}': {}", env_name, full_command);
-    }
+fn format_package_managers(managers: &[PackageManager]) -> String {
+    managers
+        .iter()
+        .map(|pm| pm.to_string())
+        .collect::<Vec<String>>()
+        .join(", ")
+}
 
-    // Validate arguments
-    validate_args(&args)?;
-
-    // Get global MicromambaManager
-    let micromamba_manager = MicromambaManager::get_global_manager()
-        .await
-        .map_err(|e| {
-            error!("Failed to initialize MicromambaManager: {}", e);
-            EnvError::Execution(
-                "Package manager not found and auto-install failed.".to_string(),
+fn format_candidates(candidates: &[ResolvedEnvironment]) -> String {
+    candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{}:{}",
+                candidate.package_manager,
+                candidate.prefix.display()
             )
-        })?;
+        })
+        .collect::<Vec<String>>()
+        .join(", ")
+}
 
-    let manager = micromamba_manager.lock().await;
-
-    // Log which package manager is being used
-    let pm = manager.get_package_manager();
-    if verbose {
-        info!("Using package manager: {}", pm);
-    } else if pm != PackageManager::Micromamba {
-        // Log if using non-default PM (conda/mamba)
-        info!("Using package manager: {} (auto-detected)", pm);
+fn select_package_managers(
+    requested_pm: Option<PackageManager>,
+    available: &[PackageManager],
+) -> Result<Vec<PackageManager>> {
+    if available.is_empty() {
+        return Err(EnvError::Execution(
+            "No package manager found and auto-install failed.".to_string(),
+        ));
     }
 
-    // Check if environment exists
-    if !manager.environment_exists(&env_name).await? {
+    if let Some(pm) = requested_pm {
+        if available.contains(&pm) {
+            return Ok(vec![pm]);
+        }
+
         return Err(EnvError::Execution(format!(
-            "Environment '{}' does not exist",
-            env_name
+            "Requested package manager '{}' is not available. Available managers: {}",
+            pm,
+            format_package_managers(available)
         )));
     }
 
-    if verbose {
-        info!("Working directory: {:?}", args.cwd);
-        info!("Environment variables: {:?}", args.env);
+    Ok(available.to_vec())
+}
+
+fn available_package_managers(requested_pm: Option<PackageManager>) -> Result<Vec<PackageManager>> {
+    let detector = PackageManagerDetector::new();
+    let available = detector.available_managers_with_env_override();
+    select_package_managers(requested_pm, &available)
+}
+
+async fn resolve_environment_candidates_for_manager(
+    env_name: &str,
+    package_manager: PackageManager,
+) -> Result<Vec<ResolvedEnvironment>> {
+    let manager = MicromambaManager::new_runtime_with_package_manager(package_manager).await?;
+    let prefixes = manager.find_environment_prefixes(env_name).await?;
+
+    Ok(prefixes
+        .into_iter()
+        .map(|prefix| ResolvedEnvironment {
+            manager: manager.clone(),
+            package_manager,
+            prefix,
+            requested_name: Some(env_name.to_string()),
+        })
+        .collect())
+}
+
+async fn resolve_environment_by_name(
+    env_name: &str,
+    requested_pm: Option<PackageManager>,
+) -> Result<ResolvedEnvironment> {
+    let package_managers = available_package_managers(requested_pm)?;
+    let mut candidates = Vec::new();
+
+    match package_managers.as_slice() {
+        [package_manager] => {
+            candidates.extend(
+                resolve_environment_candidates_for_manager(env_name, *package_manager).await?,
+            );
+        }
+        [first, second] => {
+            let (first_result, second_result) = tokio::join!(
+                resolve_environment_candidates_for_manager(env_name, *first),
+                resolve_environment_candidates_for_manager(env_name, *second),
+            );
+            candidates.extend(first_result?);
+            candidates.extend(second_result?);
+        }
+        [first, second, third] => {
+            let (first_result, second_result, third_result) = tokio::join!(
+                resolve_environment_candidates_for_manager(env_name, *first),
+                resolve_environment_candidates_for_manager(env_name, *second),
+                resolve_environment_candidates_for_manager(env_name, *third),
+            );
+            candidates.extend(first_result?);
+            candidates.extend(second_result?);
+            candidates.extend(third_result?);
+        }
+        _ => {
+            for package_manager in package_managers.iter().copied() {
+                candidates.extend(
+                    resolve_environment_candidates_for_manager(env_name, package_manager).await?,
+                );
+            }
+        }
     }
 
-    // Execute command with extended options
-    // Note: Handle SIGPIPE (exit code 141) gracefully
+    if candidates.is_empty() {
+        return Err(EnvError::Execution(format!(
+            "Environment '{}' was not found in any available package manager. Searched: {}",
+            env_name,
+            format_package_managers(&package_managers)
+        )));
+    }
+
+    let selected = candidates[0].clone();
+    if candidates.len() > 1 {
+        warn!(
+            "Environment '{}' was found in multiple package managers. Using {}:{} (candidates: {})",
+            env_name,
+            selected.package_manager,
+            selected.prefix.display(),
+            format_candidates(&candidates)
+        );
+    }
+
+    Ok(selected)
+}
+
+async fn resolve_environment_target(
+    explicit_prefix: &Path,
+    requested_pm: Option<PackageManager>,
+) -> Result<ResolvedEnvironment> {
+    let package_manager = available_package_managers(requested_pm)?[0];
+    let manager = MicromambaManager::new_runtime_with_package_manager(package_manager).await?;
+
+    Ok(ResolvedEnvironment {
+        manager,
+        package_manager,
+        prefix: explicit_prefix.to_path_buf(),
+        requested_name: None,
+    })
+}
+
+/// Execute environment run command
+pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
+    validate_args(&args)?;
+
+    let full_command = build_full_command(&args)?;
+
+    let env_name = if args.prefix.is_some() {
+        args.name.clone()
+    } else {
+        Some(args.get_env_name()?)
+    };
+
+    if verbose {
+        if let Some(ref name) = env_name {
+            info!("Executing in environment '{}': {}", name, full_command);
+        } else if let Some(ref prefix) = args.prefix {
+            info!(
+                "Executing in explicit environment prefix '{}': {}",
+                prefix.display(),
+                full_command
+            );
+        }
+    }
+
+    let resolved = if let Some(ref prefix) = args.prefix {
+        resolve_environment_target(prefix, args.pm).await?
+    } else {
+        resolve_environment_by_name(
+            env_name
+                .as_deref()
+                .ok_or_else(|| EnvError::Validation("Missing environment name".to_string()))?,
+            args.pm,
+        )
+        .await?
+    };
+
+    let ResolvedEnvironment {
+        manager,
+        package_manager,
+        prefix,
+        requested_name,
+    } = resolved;
+
+    if verbose {
+        info!(
+            "Using package manager {} with prefix {}",
+            package_manager,
+            prefix.display()
+        );
+        info!("Working directory: {:?}", args.cwd);
+        info!("Environment variables: {:?}", args.env);
+    } else if requested_name.is_none() {
+        info!(
+            "Using package manager {} with explicit prefix {}",
+            package_manager,
+            prefix.display()
+        );
+    }
+
     match manager
-        .run_in_environment_extended(
-            &env_name,
+        .run_in_environment_by_prefix_extended(
+            &prefix,
             &full_command,
             &args.env,
             &args.cwd,
@@ -149,20 +322,17 @@ pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => {
-            // Check if it's a SIGPIPE error (exit code 141)
-            let error_msg = format!("{}", e);
+        Err(error) => {
+            let error_msg = format!("{}", error);
             if error_msg.contains("exit code Some(141)") {
-                // SIGPIPE is often harmless - it means the command finished and closed the pipe
-                // Check if the environment actually ran successfully by re-checking
                 if verbose {
                     info!("Received SIGPIPE (exit code 141), but this is often harmless");
                     info!("Command likely completed successfully before pipe was closed");
                 }
                 Ok(())
             } else {
-                error!("Failed to execute command: {}", e);
-                Err(e)
+                error!("Failed to execute command: {}", error);
+                Err(error)
             }
         }
     }
@@ -170,33 +340,25 @@ pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
 
 /// Build the full command string from arguments
 fn build_full_command(args: &EnvRunArgs) -> Result<String> {
-    // This function is now deprecated - use get_command() instead
     if let Some(ref script) = args.script {
         let mut cmd = format!("Rscript {}", script.display());
 
         if !args.args.is_empty() {
-            cmd.push_str(" ");
+            cmd.push(' ');
             cmd.push_str(&args.args.join(" "));
         }
 
-        Ok(cmd)
-    } else if let Some(ref command) = args.command {
-        Ok(command.clone())
-    } else {
-        Err(EnvError::Validation(
-            "Must specify either --command or --script".to_string(),
-        ))
+        return Ok(cmd);
     }
+
+    args.get_command()
 }
 
 /// Validate command arguments
 fn validate_args(args: &EnvRunArgs) -> Result<()> {
-    // Check that either command, script, or positional args are provided
-    let has_positional_cmd = if args.name.is_some() {
-        // If --name is used, args should contain the command
+    let has_positional_cmd = if args.name.is_some() || args.prefix.is_some() {
         !args.args.is_empty()
     } else {
-        // If --name is not used, args[0] is env name, args[1+] should be command
         args.args.len() > 1
     };
 
@@ -206,14 +368,18 @@ fn validate_args(args: &EnvRunArgs) -> Result<()> {
         ));
     }
 
-    // Check that command and script are mutually exclusive
     if args.command.is_some() && args.script.is_some() {
         return Err(EnvError::Validation(
             "Cannot specify both --command and --script".to_string(),
         ));
     }
 
-    // Check that script file exists if provided
+    if args.prefix.is_none() && args.name.is_none() && args.args.is_empty() {
+        return Err(EnvError::Validation(
+            "Must specify an environment name or --prefix".to_string(),
+        ));
+    }
+
     if let Some(ref script) = args.script {
         if !script.exists() {
             return Err(EnvError::Validation(format!(
@@ -223,7 +389,15 @@ fn validate_args(args: &EnvRunArgs) -> Result<()> {
         }
     }
 
-    // Validate environment variable format
+    if let Some(ref prefix) = args.prefix {
+        if !prefix.exists() {
+            return Err(EnvError::Validation(format!(
+                "Environment prefix does not exist: {}",
+                prefix.display()
+            )));
+        }
+    }
+
     for env_pair in &args.env {
         if !env_pair.contains('=') {
             return Err(EnvError::Validation(format!(
@@ -244,6 +418,8 @@ mod tests {
     fn test_validate_args_both_command_and_script() {
         let args = EnvRunArgs {
             name: Some("test-env".to_string()),
+            pm: None,
+            prefix: None,
             command: Some("echo test".to_string()),
             script: Some(PathBuf::from("test.R")),
             args: vec![],
@@ -260,6 +436,8 @@ mod tests {
     fn test_validate_args_neither_command_nor_script() {
         let args = EnvRunArgs {
             name: Some("test-env".to_string()),
+            pm: None,
+            prefix: None,
             command: None,
             script: None,
             args: vec![],
@@ -276,6 +454,8 @@ mod tests {
     fn test_validate_args_invalid_env_format() {
         let args = EnvRunArgs {
             name: Some("test-env".to_string()),
+            pm: None,
+            prefix: None,
             command: Some("echo test".to_string()),
             script: None,
             args: vec![],
@@ -292,6 +472,8 @@ mod tests {
     fn test_validate_args_valid() {
         let args = EnvRunArgs {
             name: Some("test-env".to_string()),
+            pm: None,
+            prefix: None,
             command: Some("echo test".to_string()),
             script: None,
             args: vec![],
@@ -302,5 +484,76 @@ mod tests {
 
         let result = validate_args(&args);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_args_with_prefix_only() {
+        let args = EnvRunArgs {
+            name: None,
+            pm: None,
+            prefix: Some(PathBuf::from(".")),
+            command: Some("echo test".to_string()),
+            script: None,
+            args: vec![],
+            cwd: PathBuf::from("."),
+            env: vec![],
+            no_capture: false,
+        };
+
+        let result = validate_args(&args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_command_with_prefix_uses_all_positional_args() {
+        let args = EnvRunArgs {
+            name: None,
+            pm: None,
+            prefix: Some(PathBuf::from(".")),
+            command: None,
+            script: None,
+            args: vec!["echo".to_string(), "hello".to_string()],
+            cwd: PathBuf::from("."),
+            env: vec![],
+            no_capture: false,
+        };
+
+        assert_eq!(args.get_command().unwrap(), "echo hello");
+    }
+
+    #[test]
+    fn test_select_package_managers_honors_explicit_pm() {
+        let selected = select_package_managers(
+            Some(PackageManager::Conda),
+            &[PackageManager::Micromamba, PackageManager::Conda],
+        )
+        .unwrap();
+        assert_eq!(selected, vec![PackageManager::Conda]);
+    }
+
+    #[test]
+    fn test_select_package_managers_errors_when_pm_missing() {
+        let result = select_package_managers(
+            Some(PackageManager::Mamba),
+            &[PackageManager::Micromamba, PackageManager::Conda],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_full_command_from_command_flag() {
+        let args = EnvRunArgs {
+            name: Some("test-env".to_string()),
+            pm: None,
+            prefix: None,
+            command: Some("echo test".to_string()),
+            script: None,
+            args: vec![],
+            cwd: PathBuf::from("."),
+            env: vec![],
+            no_capture: false,
+        };
+
+        assert_eq!(build_full_command(&args).unwrap(), "echo test");
     }
 }

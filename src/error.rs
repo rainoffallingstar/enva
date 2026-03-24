@@ -141,9 +141,7 @@ impl EnvError {
             EnvError::Dependency(_) | EnvError::Resource(_) | EnvError::PermissionDenied(_) => {
                 ErrorSeverity::Error
             }
-            EnvError::FileNotFound(_) | EnvError::Workflow(_) => {
-                ErrorSeverity::Critical
-            }
+            EnvError::FileNotFound(_) | EnvError::Workflow(_) => ErrorSeverity::Critical,
             _ => ErrorSeverity::Error,
         }
     }

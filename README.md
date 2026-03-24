@@ -217,6 +217,34 @@ ENVA_PACKAGE_MANAGER=mamba enva create --core
 ENVA_PACKAGE_MANAGER=micromamba enva create --core
 ```
 
+## 📈 Benchmarking
+
+Use the in-process benchmark binary to compare cold and hot `enva run` performance:
+
+```bash
+# Build the benchmark helper
+cargo build --bin enva-bench
+
+# Benchmark automatic manager selection
+cargo run --bin enva-bench -- --env-name xdxtools-core --command "true"
+
+# Benchmark a specific package manager with more hot iterations
+cargo run --bin enva-bench -- --env-name xdxtools-core --pm micromamba --iterations 10
+
+# Compare enva against native micromamba output in JSON
+cargo run --bin enva-bench -- --env-name xdxtools-core --pm micromamba --compare-native --format json
+
+# Export CSV for regression tracking
+cargo run --bin enva-bench -- --env-name xdxtools-core --pm micromamba --format csv
+```
+
+Supported formats:
+- `text`: human-readable summary
+- `json`: machine-readable array of benchmark rows
+- `csv`: one row per benchmark result, suitable for spreadsheets or CI artifacts
+
+The first run reflects a cold path. Subsequent runs in the same process show the effect of the runtime manager and environment-list caches.
+
 ## 🛠️ Development
 
 ```bash
