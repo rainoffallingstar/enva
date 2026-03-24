@@ -1,7 +1,7 @@
 name: xdxtools-snakemake
 channels:
-  - bioconda
   - conda-forge
+  - bioconda
 dependencies:
   # Python and Core
   - python=3.11.9

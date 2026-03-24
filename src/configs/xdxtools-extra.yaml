@@ -1,7 +1,7 @@
 name: xdxtools-extra
 channels:
-  - bioconda
   - conda-forge
+  - bioconda
 dependencies:
   # Python Core
   - python=3.10.13
