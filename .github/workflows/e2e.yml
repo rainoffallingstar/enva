@@ -33,6 +33,7 @@ jobs:
             probe: "bedtools --version"
     env:
       CARGO_TERM_COLOR: always
+      ENVA_PACKAGE_MANAGER: micromamba
       RUST_BACKTRACE: 1
     steps:
       - name: Checkout code
@@ -40,6 +41,11 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up micromamba
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          generate-run-shell: false
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -73,6 +79,22 @@ jobs:
             2>&1 | tee "ci-logs/${{ matrix.label }}-list.log"
           grep -q "${{ matrix.env_name }}" "ci-logs/${{ matrix.label }}-list.log"
 
+      - name: Validate environment registration
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva validate --name "${{ matrix.env_name }}" \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-validate.log"
+
+      - name: Install single package into environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva install --name "${{ matrix.env_name }}" jq \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-install.log"
+
       - name: Run smoke command inside environment
         shell: bash
         run: |
@@ -83,11 +105,241 @@ jobs:
             --command "${{ matrix.probe }}" \
             2>&1 | tee "ci-logs/${{ matrix.label }}-run.log"
 
+      - name: Verify installed package inside environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva run \
+            --name "${{ matrix.env_name }}" \
+            --command 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version' \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-install-verify.log"
+
+      - name: Remove rattler-managed environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva remove "${{ matrix.env_name }}" \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-remove.log"
+          if ./target/release/enva validate --name "${{ matrix.env_name }}" \
+            > "ci-logs/${{ matrix.label }}-post-remove-validate.log" 2>&1; then
+            echo "Expected environment ${{ matrix.env_name }} to be absent after removal" >&2
+            cat "ci-logs/${{ matrix.label }}-post-remove-validate.log" >&2
+            exit 1
+          fi
+
       - name: Upload e2e logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: enva-e2e-${{ matrix.label }}-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  adopt-e2e:
+    name: E2E adopt-helper-path
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      ENVA_PACKAGE_MANAGER: micromamba
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up micromamba
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          generate-run-shell: false
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build enva
+        run: cargo build --release --bin enva
+
+      - name: Create foreign micromamba environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
+          micromamba create -y -n enva-adopt-ci -c conda-forge python=3.11 \
+            2>&1 | tee "ci-logs/adopt-create-foreign.log"
+          micromamba env list \
+            2>&1 | tee "ci-logs/adopt-micromamba-list-before.log"
+          grep -q "enva-adopt-ci" "ci-logs/adopt-micromamba-list-before.log"
+
+      - name: Adopt foreign environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva adopt --name enva-adopt-ci \
+            2>&1 | tee "ci-logs/adopt-command.log"
+
+      - name: Verify adopted environment discovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva list --detailed \
+            2>&1 | tee "ci-logs/adopt-list.log"
+          grep -E "enva-adopt-ci.*rattler.*micromamba.*micromamba" "ci-logs/adopt-list.log"
+
+      - name: Validate adopted environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva validate --name enva-adopt-ci \
+            2>&1 | tee "ci-logs/adopt-validate.log"
+
+      - name: Install single package into adopted environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva install --name enva-adopt-ci jq \
+            2>&1 | tee "ci-logs/adopt-install.log"
+
+      - name: Run smoke commands inside adopted environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva run \
+            --name enva-adopt-ci \
+            --command "python --version" \
+            2>&1 | tee "ci-logs/adopt-run-python.log"
+          ./target/release/enva run \
+            --name enva-adopt-ci \
+            --command 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version' \
+            2>&1 | tee "ci-logs/adopt-run-jq.log"
+
+      - name: Remove adopted environment via helper manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva remove enva-adopt-ci \
+            2>&1 | tee "ci-logs/adopt-remove.log"
+          if ./target/release/enva validate --name enva-adopt-ci \
+            > "ci-logs/adopt-post-remove-validate.log" 2>&1; then
+            echo "Expected adopted environment enva-adopt-ci to be absent after removal" >&2
+            cat "ci-logs/adopt-post-remove-validate.log" >&2
+            exit 1
+          fi
+          if micromamba env list > "ci-logs/adopt-micromamba-list-after.log" 2>&1; then
+            if grep -q "enva-adopt-ci" "ci-logs/adopt-micromamba-list-after.log"; then
+              echo "Micromamba still reports enva-adopt-ci after enva remove" >&2
+              cat "ci-logs/adopt-micromamba-list-after.log" >&2
+              exit 1
+            fi
+          else
+            cat "ci-logs/adopt-micromamba-list-after.log" >&2
+            exit 1
+          fi
+
+      - name: Upload adopt e2e logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enva-e2e-adopt-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  root-priority-e2e:
+    name: E2E active-root-precedence
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build enva
+        run: cargo build --release --bin enva
+
+      - name: Verify active conda root wins for same-name replacement
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
+
+          export HOME="${RUNNER_TEMP:-/tmp}/enva-root-priority-home"
+          export CONDA_PREFIX="${RUNNER_TEMP:-/tmp}/zz-active-conda-root"
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache-root-priority"
+          mkdir -p "$HOME/.conda" "$RATTLER_CACHE_DIR"
+          mkdir -p "$CONDA_PREFIX/conda-meta" "$CONDA_PREFIX/envs/root-priority-ci/conda-meta"
+          printf '%s\n' base-history > "$CONDA_PREFIX/conda-meta/history"
+          printf '%s\n' old-env-history > "$CONDA_PREFIX/envs/root-priority-ci/conda-meta/history"
+
+          cat > root-priority-ci.yaml <<'YAML'
+          name: root-priority-ci
+          channels:
+            - conda-forge
+          dependencies:
+            - python=3.11
+            - pip
+          YAML
+
+          ./target/release/enva create \
+            --yaml root-priority-ci.yaml \
+            --name root-priority-ci \
+            --force \
+            --clean-cache \
+            --output summary \
+            2>&1 | tee "ci-logs/root-priority-create.log"
+
+          if grep -q "already exists in other rattler-owned prefixes" "ci-logs/root-priority-create.log"; then
+            echo "Active conda root was not preferred during replacement" >&2
+            cat "ci-logs/root-priority-create.log" >&2
+            exit 1
+          fi
+
+          ./target/release/enva list --detailed \
+            2>&1 | tee "ci-logs/root-priority-list.log"
+          grep -q "$CONDA_PREFIX/envs/root-priority-ci" "ci-logs/root-priority-list.log"
+
+          expected_prefix="$CONDA_PREFIX/envs/root-priority-ci"
+          ./target/release/enva run \
+            --name root-priority-ci \
+            --command "test \"\$CONDA_PREFIX\" = \"$expected_prefix\" && python --version" \
+            2>&1 | tee "ci-logs/root-priority-run.log"
+
+          ./target/release/enva remove root-priority-ci \
+            2>&1 | tee "ci-logs/root-priority-remove.log"
+          if [ -d "$CONDA_PREFIX/envs/root-priority-ci" ]; then
+            echo "Expected root-priority-ci to be removed from active conda root" >&2
+            exit 1
+          fi
+
+      - name: Upload root-priority logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enva-e2e-root-priority-logs
           path: ci-logs/
           if-no-files-found: ignore
           retention-days: 7

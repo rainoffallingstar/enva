@@ -89,11 +89,19 @@ impl RattlerBackend {
     }
 
     fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-        let unique: BTreeSet<PathBuf> = paths
+        let mut seen = BTreeSet::new();
+        let mut unique = Vec::new();
+
+        for path in paths
             .into_iter()
             .filter(|path| !path.as_os_str().is_empty())
-            .collect();
-        unique.into_iter().collect()
+        {
+            if seen.insert(path.clone()) {
+                unique.push(path);
+            }
+        }
+
+        unique
     }
 
     fn default_root_prefix() -> PathBuf {
@@ -1195,6 +1203,40 @@ mod tests {
             .version_conflicts
             .iter()
             .any(|issue| issue.contains("pip subsection")));
+    }
+
+    #[test]
+    fn dedupe_paths_preserves_detection_order() {
+        let ordered = RattlerBackend::dedupe_paths(vec![
+            PathBuf::from("/preferred-root"),
+            PathBuf::from("/fallback-root"),
+            PathBuf::from("/preferred-root"),
+        ]);
+
+        assert_eq!(
+            ordered,
+            vec![
+                PathBuf::from("/preferred-root"),
+                PathBuf::from("/fallback-root"),
+            ]
+        );
+    }
+
+    #[test]
+    fn preferred_root_prefix_uses_first_existing_root() {
+        let tempdir = tempdir().unwrap();
+        let preferred = tempdir.path().join("preferred-root");
+        let fallback = tempdir.path().join("fallback-root");
+        fs::create_dir_all(&preferred).unwrap();
+        fs::create_dir_all(&fallback).unwrap();
+
+        let backend = RattlerBackend::with_root_prefixes(vec![
+            preferred.clone(),
+            fallback.clone(),
+            preferred.clone(),
+        ]);
+
+        assert_eq!(backend.preferred_root_prefix(), preferred);
     }
 
     #[test]
