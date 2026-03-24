@@ -9,6 +9,7 @@ use crate::prefix_registry::{
 };
 use async_trait::async_trait;
 use rattler::install::Installer;
+use rattler::package_cache::PackageCache;
 use rattler_conda_types::{
     Channel, ChannelConfig, EnvironmentYaml, MatchSpec, Platform, RepoDataRecord,
 };
@@ -212,7 +213,10 @@ impl RattlerBackend {
         let virtual_packages = Self::detect_virtual_packages()?;
         let platforms = [Platform::current(), Platform::NoArch];
 
+        let cache_root = Self::cache_root_dir()?;
         let repo_data_sets: Vec<RepoData> = Gateway::builder()
+            .with_cache_dir(cache_root.clone())
+            .with_package_cache(PackageCache::new(Self::package_cache_dir(&cache_root)))
             .finish()
             .query(channels, platforms, specs.clone())
             .recursive(true)
@@ -565,13 +569,42 @@ impl RattlerBackend {
             .await
     }
 
+    fn default_local_cache_root() -> PathBuf {
+        let tmp_root = std::env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(std::env::temp_dir);
+        let user = std::env::var("USER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+            .replace(std::path::is_separator, "_");
+
+        tmp_root.join(format!("enva-rattler-cache-{}", user))
+    }
+
     fn cache_root_dir() -> Result<PathBuf> {
-        rattler::default_cache_dir().map_err(|error| {
-            EnvError::Environment(format!(
-                "Failed to determine rattler cache directory: {}",
-                error
-            ))
-        })
+        if let Some(value) = std::env::var_os("RATTLER_CACHE_DIR") {
+            let path = PathBuf::from(value);
+            if !path.as_os_str().is_empty() {
+                return Ok(path);
+            }
+        }
+
+        if std::env::var_os("XDG_CACHE_HOME").is_some() {
+            return rattler::default_cache_dir().map_err(|error| {
+                EnvError::Environment(format!(
+                    "Failed to determine rattler cache directory: {}",
+                    error
+                ))
+            });
+        }
+
+        Ok(Self::default_local_cache_root())
+    }
+
+    fn package_cache_dir(cache_root: &Path) -> PathBuf {
+        cache_root.join("pkgs")
     }
 
     fn cache_directory_entries(cache_root: &Path) -> Vec<(&'static str, PathBuf)> {
@@ -878,7 +911,9 @@ impl EnvironmentBackend for RattlerBackend {
             );
         }
 
+        let cache_root = Self::cache_root_dir()?;
         Installer::new()
+            .with_package_cache(PackageCache::new(Self::package_cache_dir(&cache_root)))
             .with_requested_specs(requested_specs)
             .install(&target_prefix, solved_records)
             .await
@@ -1238,6 +1273,61 @@ mod tests {
                 ("run-exports".to_string(), root.join("run-exports")),
             ]
         );
+    }
+
+    #[test]
+    fn cache_root_dir_prefers_explicit_rattler_cache_override() {
+        let _guard = env_lock().lock().unwrap();
+        let previous_rattler = std::env::var_os("RATTLER_CACHE_DIR");
+        let previous_xdg = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("RATTLER_CACHE_DIR", "/tmp/custom-rattler-cache");
+        std::env::remove_var("XDG_CACHE_HOME");
+
+        let cache_root = RattlerBackend::cache_root_dir().unwrap();
+        assert_eq!(cache_root, PathBuf::from("/tmp/custom-rattler-cache"));
+
+        match previous_rattler {
+            Some(value) => std::env::set_var("RATTLER_CACHE_DIR", value),
+            None => std::env::remove_var("RATTLER_CACHE_DIR"),
+        }
+        match previous_xdg {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+    }
+
+    #[test]
+    fn cache_root_dir_defaults_to_tmp_when_unset() {
+        let _guard = env_lock().lock().unwrap();
+        let previous_rattler = std::env::var_os("RATTLER_CACHE_DIR");
+        let previous_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let previous_tmpdir = std::env::var_os("TMPDIR");
+        let previous_user = std::env::var_os("USER");
+        let tempdir = tempdir().unwrap();
+        std::env::remove_var("RATTLER_CACHE_DIR");
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::set_var("TMPDIR", tempdir.path());
+        std::env::set_var("USER", "tester");
+
+        let cache_root = RattlerBackend::cache_root_dir().unwrap();
+        assert_eq!(cache_root, tempdir.path().join("enva-rattler-cache-tester"));
+
+        match previous_rattler {
+            Some(value) => std::env::set_var("RATTLER_CACHE_DIR", value),
+            None => std::env::remove_var("RATTLER_CACHE_DIR"),
+        }
+        match previous_xdg {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match previous_tmpdir {
+            Some(value) => std::env::set_var("TMPDIR", value),
+            None => std::env::remove_var("TMPDIR"),
+        }
+        match previous_user {
+            Some(value) => std::env::set_var("USER", value),
+            None => std::env::remove_var("USER"),
+        }
     }
 
     #[tokio::test]

@@ -302,6 +302,7 @@ async fn execute_env_create(
 
     let mut success_count = 0;
     let mut failed_count = 0;
+    let mut failure_details = Vec::new();
 
     if args.clean_cache {
         backend.clean_package_cache(dry_run, args.output).await?;
@@ -352,7 +353,10 @@ async fn execute_env_create(
             }
             Err(e) => {
                 failed_count += 1;
+                let detail = format!("{}: {}", env_name, e);
                 error!("Failed to create environment {}: {}", env_name, e);
+                eprintln!("Failed to create environment {}: {}", env_name, e);
+                failure_details.push(detail);
             }
         }
     }
@@ -363,9 +367,15 @@ async fn execute_env_create(
     );
 
     if failed_count > 0 {
+        let summary = format!("{} environments failed to create", failed_count);
+        if failure_details.is_empty() {
+            return Err(EnvError::Execution(summary));
+        }
+
         return Err(EnvError::Execution(format!(
-            "{} environments failed to create",
-            failed_count
+            "{}: {}",
+            summary,
+            failure_details.join("; ")
         )));
     }
 
