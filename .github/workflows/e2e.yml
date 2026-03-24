@@ -1,0 +1,91 @@
+name: Enva E2E
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: E2E ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: xdxtools-core
+            yaml: src/configs/xdxtools-core.yaml
+            env_name: xdxtools-core-ci
+            probe: "samtools --version | head -n 1"
+          - label: xdxtools-snakemake
+            yaml: src/configs/xdxtools-snakemake.yaml
+            env_name: xdxtools-snakemake-ci
+            probe: "snakemake --version"
+          - label: xdxtools-extra
+            yaml: src/configs/xdxtools-extra.yaml
+            env_name: xdxtools-extra-ci
+            probe: "bedtools --version"
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      RATTLER_CACHE_DIR: ${{ runner.temp }}/rattler-cache
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build enva
+        run: cargo build --release --bin enva
+
+      - name: Create environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
+          ./target/release/enva create \
+            --yaml "${{ matrix.yaml }}" \
+            --name "${{ matrix.env_name }}" \
+            --force \
+            --clean-cache \
+            --output summary \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-create.log"
+
+      - name: Verify environment discovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/enva list --detailed \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-list.log"
+          grep -q "${{ matrix.env_name }}" "ci-logs/${{ matrix.label }}-list.log"
+
+      - name: Run smoke command inside environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/enva run \
+            --name "${{ matrix.env_name }}" \
+            --command "${{ matrix.probe }}" \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-run.log"
+
+      - name: Upload e2e logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enva-e2e-${{ matrix.label }}-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
