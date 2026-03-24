@@ -1,5 +1,6 @@
 //! enva - A lightweight micromamba environment manager for bioinformatics workflows
 
+pub mod backend;
 pub mod env;
 pub mod env_run;
 pub mod error;
@@ -7,6 +8,7 @@ pub mod micromamba;
 pub mod package_manager;
 
 // Re-export commonly used types
+pub use backend::{BackendKind, BackendSelector, OutputMode};
 pub use env::{execute_env_command, EnvArgs};
 pub use error::{EnvError, Result};
 pub use package_manager::{get_global_detector, PackageManager, PackageManagerDetector};

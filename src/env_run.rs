@@ -1,10 +1,12 @@
 //! Environment run command
 
+use crate::backend::factory::build_backend;
+use crate::backend::{BackendKind, BackendSelector, EnvironmentTarget, RunRequest};
 use crate::error::{EnvError, Result};
-use crate::micromamba::MicromambaManager;
 use crate::package_manager::{PackageManager, PackageManagerDetector};
 use clap::Args;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// Environment run arguments
@@ -93,8 +95,9 @@ impl EnvRunArgs {
 
 #[derive(Clone)]
 struct ResolvedEnvironment {
-    manager: MicromambaManager,
-    package_manager: PackageManager,
+    backend: Arc<dyn crate::backend::EnvironmentBackend>,
+    backend_kind: BackendKind,
+    package_manager: Option<PackageManager>,
     prefix: PathBuf,
     requested_name: Option<String>,
 }
@@ -107,13 +110,21 @@ fn format_package_managers(managers: &[PackageManager]) -> String {
         .join(", ")
 }
 
+fn backend_label(kind: BackendKind, package_manager: Option<PackageManager>) -> String {
+    match (kind, package_manager) {
+        (BackendKind::Cli, Some(pm)) => pm.to_string(),
+        (BackendKind::Cli, None) => "cli".to_string(),
+        (BackendKind::Rattler, _) => "rattler".to_string(),
+    }
+}
+
 fn format_candidates(candidates: &[ResolvedEnvironment]) -> String {
     candidates
         .iter()
         .map(|candidate| {
             format!(
                 "{}:{}",
-                candidate.package_manager,
+                backend_label(candidate.backend_kind, candidate.package_manager),
                 candidate.prefix.display()
             )
         })
@@ -146,6 +157,19 @@ fn select_package_managers(
     Ok(available.to_vec())
 }
 
+fn validate_backend_request(
+    selector: &BackendSelector,
+    requested_pm: Option<PackageManager>,
+) -> Result<()> {
+    if selector.kind == BackendKind::Rattler && requested_pm.is_some() {
+        return Err(EnvError::Validation(
+            "--pm can only be used with the CLI backend".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn available_package_managers(requested_pm: Option<PackageManager>) -> Result<Vec<PackageManager>> {
     let detector = PackageManagerDetector::new();
     let available = detector.available_managers_with_env_override();
@@ -156,14 +180,15 @@ async fn resolve_environment_candidates_for_manager(
     env_name: &str,
     package_manager: PackageManager,
 ) -> Result<Vec<ResolvedEnvironment>> {
-    let manager = MicromambaManager::new_runtime_with_package_manager(package_manager).await?;
-    let prefixes = manager.find_environment_prefixes(env_name).await?;
+    let backend = build_backend(BackendSelector::cli(Some(package_manager))).await?;
+    let prefixes = backend.find_environment_prefixes(env_name).await?;
 
     Ok(prefixes
         .into_iter()
         .map(|prefix| ResolvedEnvironment {
-            manager: manager.clone(),
-            package_manager,
+            backend: backend.clone(),
+            backend_kind: BackendKind::Cli,
+            package_manager: Some(package_manager),
             prefix,
             requested_name: Some(env_name.to_string()),
         })
@@ -172,79 +197,141 @@ async fn resolve_environment_candidates_for_manager(
 
 async fn resolve_environment_by_name(
     env_name: &str,
+    selector: BackendSelector,
     requested_pm: Option<PackageManager>,
 ) -> Result<ResolvedEnvironment> {
-    let package_managers = available_package_managers(requested_pm)?;
-    let mut candidates = Vec::new();
+    validate_backend_request(&selector, requested_pm)?;
 
-    match package_managers.as_slice() {
-        [package_manager] => {
-            candidates.extend(
-                resolve_environment_candidates_for_manager(env_name, *package_manager).await?,
-            );
-        }
-        [first, second] => {
-            let (first_result, second_result) = tokio::join!(
-                resolve_environment_candidates_for_manager(env_name, *first),
-                resolve_environment_candidates_for_manager(env_name, *second),
-            );
-            candidates.extend(first_result?);
-            candidates.extend(second_result?);
-        }
-        [first, second, third] => {
-            let (first_result, second_result, third_result) = tokio::join!(
-                resolve_environment_candidates_for_manager(env_name, *first),
-                resolve_environment_candidates_for_manager(env_name, *second),
-                resolve_environment_candidates_for_manager(env_name, *third),
-            );
-            candidates.extend(first_result?);
-            candidates.extend(second_result?);
-            candidates.extend(third_result?);
-        }
-        _ => {
-            for package_manager in package_managers.iter().copied() {
-                candidates.extend(
-                    resolve_environment_candidates_for_manager(env_name, package_manager).await?,
+    match selector.kind {
+        BackendKind::Cli => {
+            let package_managers = available_package_managers(requested_pm)?;
+            let mut candidates = Vec::new();
+
+            match package_managers.as_slice() {
+                [package_manager] => {
+                    candidates.extend(
+                        resolve_environment_candidates_for_manager(env_name, *package_manager)
+                            .await?,
+                    );
+                }
+                [first, second] => {
+                    let (first_result, second_result) = tokio::join!(
+                        resolve_environment_candidates_for_manager(env_name, *first),
+                        resolve_environment_candidates_for_manager(env_name, *second),
+                    );
+                    candidates.extend(first_result?);
+                    candidates.extend(second_result?);
+                }
+                [first, second, third] => {
+                    let (first_result, second_result, third_result) = tokio::join!(
+                        resolve_environment_candidates_for_manager(env_name, *first),
+                        resolve_environment_candidates_for_manager(env_name, *second),
+                        resolve_environment_candidates_for_manager(env_name, *third),
+                    );
+                    candidates.extend(first_result?);
+                    candidates.extend(second_result?);
+                    candidates.extend(third_result?);
+                }
+                _ => {
+                    for package_manager in package_managers.iter().copied() {
+                        candidates.extend(
+                            resolve_environment_candidates_for_manager(env_name, package_manager)
+                                .await?,
+                        );
+                    }
+                }
+            }
+
+            if candidates.is_empty() {
+                return Err(EnvError::Execution(format!(
+                    "Environment '{}' was not found in any available package manager. Searched: {}",
+                    env_name,
+                    format_package_managers(&package_managers)
+                )));
+            }
+
+            let selected = candidates[0].clone();
+            if candidates.len() > 1 {
+                warn!(
+                    "Environment '{}' was found in multiple package managers. Using {}:{} (candidates: {})",
+                    env_name,
+                    backend_label(selected.backend_kind, selected.package_manager),
+                    selected.prefix.display(),
+                    format_candidates(&candidates)
                 );
             }
+
+            Ok(selected)
+        }
+        BackendKind::Rattler => {
+            let backend = build_backend(selector).await?;
+            let prefixes = backend.find_environment_prefixes(env_name).await?;
+
+            if prefixes.is_empty() {
+                return Err(EnvError::Execution(format!(
+                    "Environment '{}' was not found in configured rattler roots",
+                    env_name
+                )));
+            }
+
+            let candidates = prefixes
+                .into_iter()
+                .map(|prefix| ResolvedEnvironment {
+                    backend: backend.clone(),
+                    backend_kind: BackendKind::Rattler,
+                    package_manager: None,
+                    prefix,
+                    requested_name: Some(env_name.to_string()),
+                })
+                .collect::<Vec<ResolvedEnvironment>>();
+
+            let selected = candidates[0].clone();
+            if candidates.len() > 1 {
+                warn!(
+                    "Environment '{}' was found in multiple rattler prefixes. Using {}:{} (candidates: {})",
+                    env_name,
+                    backend_label(selected.backend_kind, selected.package_manager),
+                    selected.prefix.display(),
+                    format_candidates(&candidates)
+                );
+            }
+
+            Ok(selected)
         }
     }
-
-    if candidates.is_empty() {
-        return Err(EnvError::Execution(format!(
-            "Environment '{}' was not found in any available package manager. Searched: {}",
-            env_name,
-            format_package_managers(&package_managers)
-        )));
-    }
-
-    let selected = candidates[0].clone();
-    if candidates.len() > 1 {
-        warn!(
-            "Environment '{}' was found in multiple package managers. Using {}:{} (candidates: {})",
-            env_name,
-            selected.package_manager,
-            selected.prefix.display(),
-            format_candidates(&candidates)
-        );
-    }
-
-    Ok(selected)
 }
 
 async fn resolve_environment_target(
     explicit_prefix: &Path,
+    selector: BackendSelector,
     requested_pm: Option<PackageManager>,
 ) -> Result<ResolvedEnvironment> {
-    let package_manager = available_package_managers(requested_pm)?[0];
-    let manager = MicromambaManager::new_runtime_with_package_manager(package_manager).await?;
+    validate_backend_request(&selector, requested_pm)?;
 
-    Ok(ResolvedEnvironment {
-        manager,
-        package_manager,
-        prefix: explicit_prefix.to_path_buf(),
-        requested_name: None,
-    })
+    match selector.kind {
+        BackendKind::Cli => {
+            let package_manager = available_package_managers(requested_pm)?[0];
+            let backend = build_backend(BackendSelector::cli(Some(package_manager))).await?;
+
+            Ok(ResolvedEnvironment {
+                backend,
+                backend_kind: BackendKind::Cli,
+                package_manager: Some(package_manager),
+                prefix: explicit_prefix.to_path_buf(),
+                requested_name: None,
+            })
+        }
+        BackendKind::Rattler => {
+            let backend = build_backend(selector).await?;
+            Ok(ResolvedEnvironment {
+                backend,
+                backend_kind: BackendKind::Rattler,
+                package_manager: None,
+                prefix: explicit_prefix.to_path_buf(),
+                requested_name: None,
+            })
+        }
+    }
 }
 
 /// Execute environment run command
@@ -252,6 +339,7 @@ pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
     validate_args(&args)?;
 
     let full_command = build_full_command(&args)?;
+    let selector = BackendSelector::from_env();
 
     let env_name = if args.prefix.is_some() {
         args.name.clone()
@@ -272,47 +360,52 @@ pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
     }
 
     let resolved = if let Some(ref prefix) = args.prefix {
-        resolve_environment_target(prefix, args.pm).await?
+        resolve_environment_target(prefix, selector.clone(), args.pm).await?
     } else {
         resolve_environment_by_name(
             env_name
                 .as_deref()
                 .ok_or_else(|| EnvError::Validation("Missing environment name".to_string()))?,
+            selector.clone(),
             args.pm,
         )
         .await?
     };
 
     let ResolvedEnvironment {
-        manager,
+        backend,
+        backend_kind,
         package_manager,
         prefix,
         requested_name,
     } = resolved;
 
+    let backend_name = backend_label(backend_kind, package_manager);
     if verbose {
         info!(
-            "Using package manager {} with prefix {}",
-            package_manager,
+            "Using backend {} with prefix {}",
+            backend_name,
             prefix.display()
         );
         info!("Working directory: {:?}", args.cwd);
         info!("Environment variables: {:?}", args.env);
     } else if requested_name.is_none() {
         info!(
-            "Using package manager {} with explicit prefix {}",
-            package_manager,
+            "Using backend {} with explicit prefix {}",
+            backend_name,
             prefix.display()
         );
     }
 
-    match manager
-        .run_in_environment_by_prefix_extended(
-            &prefix,
-            &full_command,
-            &args.env,
-            &args.cwd,
-            !args.no_capture,
+    match backend
+        .run(
+            &EnvironmentTarget::Prefix(prefix.clone()),
+            &RunRequest {
+                command: full_command.clone(),
+                env_vars: args.env.clone(),
+                cwd: args.cwd.clone(),
+                capture_output: !args.no_capture,
+            },
         )
         .await
     {
@@ -555,5 +648,17 @@ mod tests {
         };
 
         assert_eq!(build_full_command(&args).unwrap(), "echo test");
+    }
+
+    #[test]
+    fn test_validate_backend_request_rejects_pm_for_rattler() {
+        let result = validate_backend_request(
+            &BackendSelector {
+                kind: BackendKind::Rattler,
+                package_manager: None,
+            },
+            Some(PackageManager::Micromamba),
+        );
+        assert!(result.is_err());
     }
 }

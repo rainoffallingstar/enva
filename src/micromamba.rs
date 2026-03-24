@@ -12,7 +12,7 @@
 //! - Cross-platform support (Linux/macOS)
 //! - Performance: 2-3x faster than conda
 
-use crate::env::OutputMode;
+use crate::backend::OutputMode;
 use crate::error::{EnvError, Result};
 use crate::package_manager::{PackageManager, PackageManagerDetector};
 use indicatif::{ProgressBar, ProgressStyle};

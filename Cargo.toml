@@ -44,6 +44,11 @@ reqwest = { version = "0.10", features = ["json", "stream", "blocking", "rustls-
 # Additional utilities
 regex = "1.10"
 dirs = "5.0"
+rattler = { version = "0.40.2", default-features = false, features = ["rustls-tls"] }
+rattler_conda_types = { version = "0.44.2", default-features = false }
+rattler_repodata_gateway = { version = "0.27.2", default-features = false, features = ["gateway", "rustls-tls"] }
+rattler_solve = { version = "5.0.2", default-features = false, features = ["resolvo"] }
+rattler_virtual_packages = "2.3.14"
 
 [[bin]]
 name = "enva"

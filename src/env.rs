@@ -1,23 +1,11 @@
 //! Environment management commands
 
+use crate::backend::factory::build_default_backend;
+use crate::backend::OutputMode;
 use crate::error::{EnvError, Result};
-use crate::micromamba::MicromambaManager;
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum OutputMode {
-    Stream,
-    Summary,
-    Quiet,
-}
-
-impl Default for OutputMode {
-    fn default() -> Self {
-        Self::Summary
-    }
-}
 
 /// Environment management arguments
 #[derive(Debug, Clone, Args)]
@@ -167,10 +155,7 @@ async fn execute_env_create(
         info!("Starting conda environment creation...");
     }
 
-    let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
-        error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution("Micromamba not found and auto-install failed.".to_string())
-    })?;
+    let backend = build_default_backend().await?;
 
     // Determine which environments to create
     let mut environments_to_create = Vec::new();
@@ -302,14 +287,10 @@ async fn execute_env_create(
     let mut failed_count = 0;
 
     if args.clean_cache {
-        let manager = micromamba_manager.lock().await;
-        manager.clean_package_cache(dry_run, args.output).await?;
+        backend.clean_package_cache(dry_run, args.output).await?;
     }
 
     for env_name in environments_to_create {
-        // Lock manager for this iteration
-        let manager = micromamba_manager.lock().await;
-
         // Determine YAML file to use
         let yaml_file = if let Some(ref yaml_path) = args.yaml {
             // Use custom YAML file
@@ -344,7 +325,7 @@ async fn execute_env_create(
             }
         };
 
-        match manager
+        match backend
             .create_environment(env_name, &yaml_file, dry_run, args.force, args.output)
             .await
         {
@@ -395,12 +376,7 @@ async fn execute_env_validate(
         info!("Validating conda environment configuration...");
     }
 
-    let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
-        error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution("Micromamba not found and auto-install failed.".to_string())
-    })?;
-
-    let manager = micromamba_manager.lock().await;
+    let backend = build_default_backend().await?;
 
     if args.all || args.name.is_none() {
         // Validate all environments by checking if they exist
@@ -411,7 +387,7 @@ async fn execute_env_validate(
             let mut results = Vec::new();
 
             for env_name in env_names {
-                let exists = manager.environment_exists(env_name).await.unwrap_or(false);
+                let exists = backend.environment_exists(env_name).await.unwrap_or(false);
                 results.push(json!({
                     "environment": env_name,
                     "exists": exists,
@@ -427,7 +403,7 @@ async fn execute_env_validate(
         let mut all_valid = true;
 
         for env_name in env_names {
-            match manager.environment_exists(env_name).await {
+            match backend.environment_exists(env_name).await {
                 Ok(true) => {
                     if verbose {
                         info!("Environment {} is valid", env_name);
@@ -455,7 +431,7 @@ async fn execute_env_validate(
         }
     } else if let Some(ref name) = args.name {
         // Validate specific environment
-        match manager.environment_exists(name).await {
+        match backend.environment_exists(name).await {
             Ok(true) => {
                 info!("Environment {} is valid", name);
                 Ok(())
@@ -481,12 +457,8 @@ async fn execute_env_validate(
 async fn execute_env_install(args: EnvInstallArgs, verbose: bool) -> Result<()> {
     info!("Installing packages in conda environment...");
 
-    let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
-        error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution("Micromamba not found and auto-install failed.".to_string())
-    })?;
+    let backend = build_default_backend().await?;
 
-    let manager = micromamba_manager.lock().await;
     let env_name = args.name.as_deref().unwrap_or("xdxtools-core");
 
     // Flatten and parse package list (support comma-separated)
@@ -512,7 +484,7 @@ async fn execute_env_install(args: EnvInstallArgs, verbose: bool) -> Result<()> 
         info!("Packages to install: {:?}", packages_to_install);
     }
 
-    match manager
+    match backend
         .install_packages(env_name, &packages_to_install)
         .await
     {
@@ -531,14 +503,9 @@ async fn execute_env_install(args: EnvInstallArgs, verbose: bool) -> Result<()> 
 async fn execute_env_remove(name: String, verbose: bool) -> Result<()> {
     info!("Removing conda environment: {}", name);
 
-    let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
-        error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution("Micromamba not found and auto-install failed.".to_string())
-    })?;
+    let backend = build_default_backend().await?;
 
-    let manager = micromamba_manager.lock().await;
-
-    match manager
+    match backend
         .remove_environment_with_output(
             &name,
             if verbose {
@@ -565,18 +532,10 @@ async fn execute_env_remove(name: String, verbose: bool) -> Result<()> {
 /// This function displays all conda environments in the system,
 /// showing their names and prefix paths.
 async fn list_all_conda_environments(json: bool) -> Result<()> {
-    use crate::micromamba::MicromambaManager;
-
-    // Get the global manager
-    let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
-        error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution("Micromamba not found and auto-install failed.".to_string())
-    })?;
-
-    let manager = micromamba_manager.lock().await;
+    let backend = build_default_backend().await?;
 
     // Get all conda environments
-    let environments = manager.get_all_conda_environments().await?;
+    let environments = backend.get_all_conda_environments().await?;
 
     if json {
         // JSON output
