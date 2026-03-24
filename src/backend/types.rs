@@ -66,8 +66,15 @@ pub struct RunRequest {
 #[cfg(test)]
 mod tests {
     use super::{BackendKind, BackendSelector};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn with_backend_env<T>(value: Option<&str>, operation: impl FnOnce() -> T) -> T {
+        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("ENVA_BACKEND").ok();
 
         match value {

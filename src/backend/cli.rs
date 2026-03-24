@@ -80,6 +80,16 @@ impl EnvironmentBackend for CliBackend {
         manager.install_packages(env_name, packages).await
     }
 
+    async fn adopt_environment(
+        &self,
+        _target: &EnvironmentTarget,
+        _output_mode: OutputMode,
+    ) -> Result<()> {
+        Err(EnvError::Execution(
+            "adopt is only supported by the rattler backend".to_string(),
+        ))
+    }
+
     async fn remove_environment_with_output(
         &self,
         env_name: &str,

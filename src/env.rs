@@ -3,6 +3,7 @@
 use crate::backend::factory::build_default_backend;
 use crate::backend::OutputMode;
 use crate::error::{EnvError, Result};
+use crate::micromamba::CondaEnvironment;
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
@@ -99,6 +100,18 @@ pub struct EnvInstallArgs {
     pub name: Option<String>,
 }
 
+/// Environment adoption arguments
+#[derive(Debug, Clone, Args)]
+pub struct EnvAdoptArgs {
+    /// Environment name to adopt into rattler ownership
+    #[arg(long, conflicts_with = "prefix")]
+    pub name: Option<String>,
+
+    /// Explicit prefix path to adopt into rattler ownership
+    #[arg(long, value_name = "PREFIX", conflicts_with = "name")]
+    pub prefix: Option<PathBuf>,
+}
+
 /// Environment command subcommands
 #[derive(Subcommand, Debug)]
 pub enum EnvCommand {
@@ -113,6 +126,9 @@ pub enum EnvCommand {
 
     /// Install components in environment
     Install(EnvInstallArgs),
+
+    /// Adopt an existing environment into rattler ownership
+    Adopt(EnvAdoptArgs),
 
     /// Remove conda environment
     Remove {
@@ -137,6 +153,7 @@ pub async fn execute_env_command(
         EnvCommand::List(args) => execute_env_list(args, verbose, json).await,
         EnvCommand::Validate(args) => execute_env_validate(args, verbose, dry_run, json).await,
         EnvCommand::Install(args) => execute_env_install(args, verbose).await,
+        EnvCommand::Adopt(args) => execute_env_adopt(args, verbose).await,
         EnvCommand::Remove { name } => execute_env_remove(name, verbose).await,
         EnvCommand::Run(args) => crate::env_run::execute_env_run(args, verbose).await,
     }
@@ -356,11 +373,11 @@ async fn execute_env_create(
 }
 
 /// Execute environment list
-async fn execute_env_list(_args: EnvListArgs, _verbose: bool, json: bool) -> Result<()> {
+async fn execute_env_list(args: EnvListArgs, _verbose: bool, json: bool) -> Result<()> {
     info!("Listing conda environments...");
 
     // 直接显示所有 conda 环境
-    list_all_conda_environments(json).await
+    list_all_conda_environments(args.detailed, json).await
 }
 
 /// Execute environment validation
@@ -499,6 +516,33 @@ async fn execute_env_install(args: EnvInstallArgs, verbose: bool) -> Result<()> 
     }
 }
 
+/// Execute environment adoption
+async fn execute_env_adopt(args: EnvAdoptArgs, verbose: bool) -> Result<()> {
+    info!("Adopting environment into rattler ownership...");
+
+    let backend = build_default_backend().await?;
+    let target = match (args.name, args.prefix) {
+        (Some(name), None) => crate::backend::EnvironmentTarget::Name(name),
+        (None, Some(prefix)) => crate::backend::EnvironmentTarget::Prefix(prefix),
+        _ => {
+            return Err(EnvError::Validation(
+                "Must specify exactly one of --name or --prefix".to_string(),
+            ))
+        }
+    };
+
+    backend
+        .adopt_environment(
+            &target,
+            if verbose {
+                OutputMode::Stream
+            } else {
+                OutputMode::Summary
+            },
+        )
+        .await
+}
+
 /// Execute environment removal
 async fn execute_env_remove(name: String, verbose: bool) -> Result<()> {
     info!("Removing conda environment: {}", name);
@@ -527,57 +571,269 @@ async fn execute_env_remove(name: String, verbose: bool) -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct GroupedEnvironmentPrefix {
+    prefix: String,
+    active: bool,
+    owner: Option<String>,
+    source: Option<String>,
+    adopted_from: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct GroupedEnvironmentView {
+    name: String,
+    active: bool,
+    primary_prefix: String,
+    primary_owner: Option<String>,
+    prefixes: Vec<GroupedEnvironmentPrefix>,
+}
+
+fn owner_priority_label(owner: Option<&str>) -> u8 {
+    match owner {
+        Some(owner) if owner.eq_ignore_ascii_case("rattler") => 0,
+        Some(owner) if owner.eq_ignore_ascii_case("external") => 1,
+        Some(_) => 2,
+        None => 3,
+    }
+}
+
+fn source_priority_label(source: Option<&str>) -> u8 {
+    match source {
+        Some(source) if source.eq_ignore_ascii_case("rattler") => 0,
+        Some(source) if source.eq_ignore_ascii_case("micromamba") => 1,
+        Some(source) if source.eq_ignore_ascii_case("mamba") => 2,
+        Some(source) if source.eq_ignore_ascii_case("conda") => 3,
+        Some(_) => 4,
+        None => 5,
+    }
+}
+
+fn group_conda_environments(environments: Vec<CondaEnvironment>) -> Vec<GroupedEnvironmentView> {
+    use std::collections::BTreeMap;
+
+    let mut grouped: BTreeMap<String, Vec<CondaEnvironment>> = BTreeMap::new();
+    for environment in environments {
+        grouped
+            .entry(environment.name.clone())
+            .or_default()
+            .push(environment);
+    }
+
+    grouped
+        .into_iter()
+        .map(|(name, mut entries)| {
+            entries.sort_by(|left, right| {
+                owner_priority_label(left.owner.as_deref())
+                    .cmp(&owner_priority_label(right.owner.as_deref()))
+                    .then_with(|| {
+                        source_priority_label(left.source.as_deref())
+                            .cmp(&source_priority_label(right.source.as_deref()))
+                    })
+                    .then_with(|| right.is_active.cmp(&left.is_active))
+                    .then(left.prefix.cmp(&right.prefix))
+            });
+
+            let prefixes = entries
+                .iter()
+                .map(|entry| GroupedEnvironmentPrefix {
+                    prefix: entry.prefix.clone(),
+                    active: entry.is_active,
+                    owner: entry.owner.clone(),
+                    source: entry.source.clone(),
+                    adopted_from: entry.adopted_from.clone(),
+                })
+                .collect::<Vec<GroupedEnvironmentPrefix>>();
+
+            GroupedEnvironmentView {
+                name,
+                active: entries.iter().any(|entry| entry.is_active),
+                primary_prefix: entries
+                    .first()
+                    .map(|entry| entry.prefix.clone())
+                    .unwrap_or_default(),
+                primary_owner: entries.first().and_then(|entry| entry.owner.clone()),
+                prefixes,
+            }
+        })
+        .collect()
+}
+
 /// List all conda environments (not just enva-managed ones)
 ///
 /// This function displays all conda environments in the system,
-/// showing their names and prefix paths.
-async fn list_all_conda_environments(json: bool) -> Result<()> {
+/// showing merged same-name environments and their prefix paths.
+async fn list_all_conda_environments(detailed: bool, json: bool) -> Result<()> {
     let backend = build_default_backend().await?;
-
-    // Get all conda environments
-    let environments = backend.get_all_conda_environments().await?;
+    let grouped = group_conda_environments(backend.get_all_conda_environments().await?);
 
     if json {
-        // JSON output
-        use serde_json::Value;
-        let env_array: Vec<Value> = environments
-            .iter()
-            .map(|env| {
-                serde_json::json!({
-                    "name": env.name,
-                    "prefix": env.prefix,
-                    "active": env.is_active,
-                })
-            })
-            .collect();
-
         let output = serde_json::json!({
-            "environments": env_array,
-            "count": environments.len()
+            "environments": grouped,
+            "count": grouped.len()
         });
-
         println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        // Table format
-        if environments.is_empty() {
-            info!("No conda environments found");
-            return Ok(());
-        }
-
-        println!();
-        println!("{:<30} | {}", "Name", "Prefix");
-        println!("{}", "-".repeat(100));
-
-        for env in &environments {
-            let active_mark = if env.is_active { "*" } else { "" };
-            println!(
-                "{:<30} | {}",
-                format!("{}{}", env.name, active_mark),
-                env.prefix
-            );
-        }
-        println!();
+        return Ok(());
     }
 
+    if grouped.is_empty() {
+        info!("No conda environments found");
+        return Ok(());
+    }
+
+    println!();
+    if detailed {
+        println!(
+            "{:<30} | {:<10} | {:<12} | {:<12} | {}",
+            "Name", "Owner", "Source", "Adopted From", "Prefix"
+        );
+        println!("{}", "-".repeat(120));
+
+        for environment in &grouped {
+            for (index, prefix) in environment.prefixes.iter().enumerate() {
+                let name = if index == 0 {
+                    format!(
+                        "{}{}",
+                        environment.name,
+                        if environment.active { "*" } else { "" }
+                    )
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{:<30} | {:<10} | {:<12} | {:<12} | {}",
+                    name,
+                    prefix.owner.as_deref().unwrap_or("unknown"),
+                    prefix.source.as_deref().unwrap_or("unknown"),
+                    prefix.adopted_from.as_deref().unwrap_or("-"),
+                    prefix.prefix
+                );
+            }
+        }
+    } else {
+        println!("{:<30} | {:<10} | {}", "Name", "Owner", "Prefixes");
+        println!("{}", "-".repeat(120));
+
+        for environment in &grouped {
+            let joined = environment
+                .prefixes
+                .iter()
+                .map(|prefix| prefix.prefix.as_str())
+                .collect::<Vec<&str>>()
+                .join(" ; ");
+            println!(
+                "{:<30} | {:<10} | {}",
+                format!(
+                    "{}{}",
+                    environment.name,
+                    if environment.active { "*" } else { "" }
+                ),
+                environment.primary_owner.as_deref().unwrap_or("unknown"),
+                joined
+            );
+        }
+    }
+    println!();
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{group_conda_environments, owner_priority_label, source_priority_label};
+    use crate::micromamba::CondaEnvironment;
+
+    fn environment(
+        name: &str,
+        prefix: &str,
+        active: bool,
+        owner: Option<&str>,
+        source: Option<&str>,
+        adopted_from: Option<&str>,
+    ) -> CondaEnvironment {
+        CondaEnvironment {
+            name: name.to_string(),
+            prefix: prefix.to_string(),
+            is_active: active,
+            source: source.map(str::to_string),
+            owner: owner.map(str::to_string),
+            adopted_from: adopted_from.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn owner_priority_prefers_rattler_before_external() {
+        assert!(owner_priority_label(Some("rattler")) < owner_priority_label(Some("external")));
+    }
+
+    #[test]
+    fn source_priority_prefers_rattler_then_micromamba_then_mamba_then_conda() {
+        assert!(source_priority_label(Some("rattler")) < source_priority_label(Some("micromamba")));
+        assert!(source_priority_label(Some("micromamba")) < source_priority_label(Some("mamba")));
+        assert!(source_priority_label(Some("mamba")) < source_priority_label(Some("conda")));
+    }
+
+    #[test]
+    fn group_conda_environments_merges_same_name_and_sorts_prefixes_by_priority() {
+        let grouped = group_conda_environments(vec![
+            environment(
+                "demo",
+                "/conda/demo",
+                false,
+                Some("external"),
+                Some("conda"),
+                None,
+            ),
+            environment(
+                "demo",
+                "/mamba/demo",
+                false,
+                Some("external"),
+                Some("mamba"),
+                None,
+            ),
+            environment(
+                "demo",
+                "/rattler/demo",
+                false,
+                Some("rattler"),
+                Some("rattler"),
+                None,
+            ),
+            environment(
+                "demo",
+                "/micromamba/demo",
+                true,
+                Some("external"),
+                Some("micromamba"),
+                None,
+            ),
+            environment(
+                "other",
+                "/other",
+                false,
+                Some("external"),
+                Some("conda"),
+                None,
+            ),
+        ]);
+
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].name, "demo");
+        assert!(grouped[0].active);
+        assert_eq!(grouped[0].primary_prefix, "/rattler/demo");
+        assert_eq!(
+            grouped[0]
+                .prefixes
+                .iter()
+                .map(|prefix| prefix.prefix.as_str())
+                .collect::<Vec<&str>>(),
+            vec![
+                "/rattler/demo",
+                "/micromamba/demo",
+                "/mamba/demo",
+                "/conda/demo"
+            ]
+        );
+    }
 }

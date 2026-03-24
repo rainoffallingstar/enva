@@ -5,7 +5,9 @@ pub mod env;
 pub mod env_run;
 pub mod error;
 pub mod micromamba;
+mod ownership;
 pub mod package_manager;
+mod prefix_registry;
 
 // Re-export commonly used types
 pub use backend::{BackendKind, BackendSelector, OutputMode};

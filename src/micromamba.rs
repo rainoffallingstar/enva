@@ -1450,16 +1450,18 @@ impl MicromambaManager {
     }
 
     /// Remove environment with configurable output handling
-    pub async fn remove_environment_with_output(
+    async fn remove_environment_target_with_output(
         &self,
-        env_name: &str,
+        target_flag: &str,
+        target: &str,
+        display_name: &str,
         output_mode: OutputMode,
     ) -> Result<()> {
         let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("env")
             .arg("remove")
-            .arg("-n")
-            .arg(env_name)
+            .arg(target_flag)
+            .arg(target)
             .arg("-y");
 
         let output = match output_mode {
@@ -1500,13 +1502,32 @@ impl MicromambaManager {
         }
 
         if matches!(output_mode, OutputMode::Summary) {
-            println!("✓ Removed environment {}", env_name);
+            println!("✓ Removed environment {}", display_name);
         }
 
         self.invalidate_environment_list_cache();
         Self::invalidate_runtime_manager_cache(self.pm_type);
-        info!("Environment {} removed successfully", env_name);
+        info!("Environment {} removed successfully", display_name);
         Ok(())
+    }
+
+    pub async fn remove_environment_with_output(
+        &self,
+        env_name: &str,
+        output_mode: OutputMode,
+    ) -> Result<()> {
+        self.remove_environment_target_with_output("-n", env_name, env_name, output_mode)
+            .await
+    }
+
+    pub async fn remove_environment_by_prefix_with_output(
+        &self,
+        prefix: &Path,
+        output_mode: OutputMode,
+    ) -> Result<()> {
+        let prefix_str = prefix.to_string_lossy().to_string();
+        self.remove_environment_target_with_output("-p", &prefix_str, &prefix_str, output_mode)
+            .await
     }
 
     /// Validate YAML file (dry-run)
@@ -1608,12 +1629,6 @@ impl MicromambaManager {
 
     /// Install packages in environment
     pub async fn install_packages(&self, env_name: &str, packages: &[String]) -> Result<()> {
-        use tokio::process::Command as AsyncCommand;
-
-        // Use lock to prevent race conditions during package installation
-        let _lock = self.creation_lock.lock().await;
-
-        // Check if environment exists
         if !self.environment_exists(env_name).await? {
             return Err(EnvError::Execution(format!(
                 "Environment '{}' does not exist. Please create it first using 'xdxtools env create --name {}'",
@@ -1622,50 +1637,83 @@ impl MicromambaManager {
             )));
         }
 
-        info!(
-            "Installing packages in environment '{}': {:?}",
-            env_name, packages
-        );
-        debug!("micromamba path: {:?}", self.pm_path);
+        let prefix = self
+            .find_environment_prefixes(env_name)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                EnvError::Execution(format!(
+                    "Environment '{}' does not have a resolvable prefix",
+                    env_name
+                ))
+            })?;
 
-        // Build micromamba install command with default channels
+        self.install_packages_by_prefix(&prefix, packages).await
+    }
+
+    pub async fn install_packages_by_prefix(
+        &self,
+        prefix: &Path,
+        packages: &[String],
+    ) -> Result<()> {
+        use tokio::process::Command as AsyncCommand;
+
+        let _lock = self.creation_lock.lock().await;
+
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        if !prefix.join("conda-meta").is_dir() {
+            return Err(EnvError::Execution(format!(
+                "Environment prefix is not a valid conda environment: {}",
+                prefix.display()
+            )));
+        }
+
+        info!(
+            "Installing packages in environment prefix '{}': {:?}",
+            prefix.display(),
+            packages
+        );
+        debug!("package manager path: {:?}", self.pm_path);
+
         let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("install")
-            .arg("-n")
-            .arg(env_name)
+            .arg("-p")
+            .arg(prefix)
             .arg("-c")
             .arg("conda-forge")
             .arg("-c")
             .arg("bioconda")
             .arg("-y");
 
-        // Add all packages to install
         for package in packages {
             cmd.arg(package);
         }
 
-        // Inherit stdout/stderr to show installation progress
         cmd.stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit());
 
-        // Apply environment variables
         self.apply_env_to_command(&mut cmd);
 
-        let status = cmd
-            .status()
-            .await
-            .map_err(|e| EnvError::Execution(format!("Failed to execute micromamba: {}", e)))?;
+        let status = cmd.status().await.map_err(|e| {
+            EnvError::Execution(format!("Failed to execute {} install: {}", self.pm_type, e))
+        })?;
 
         if !status.success() {
             return Err(EnvError::Execution(format!(
-                "Failed to install packages: micromamba command failed with exit code {:?}",
+                "Failed to install packages into {} using {}: exit code {:?}",
+                prefix.display(),
+                self.pm_type,
                 status.code()
             )));
         }
 
         info!(
-            "Successfully installed packages in environment '{}'",
-            env_name
+            "Successfully installed packages in environment prefix '{}'",
+            prefix.display()
         );
         Ok(())
     }
@@ -1803,34 +1851,35 @@ dependencies:
     /// This function executes `conda env list` (or mamba/micromamba) and parses the output
     /// to return a list of all conda environments with their names and prefixes.
     pub async fn get_all_conda_environments(&self) -> Result<Vec<CondaEnvironment>> {
-        let cmd_name = match &self.pm_type {
-            PackageManager::Conda => "conda",
-            PackageManager::Mamba => "mamba",
-            PackageManager::Micromamba => "micromamba",
-            PackageManager::None => {
-                return Ok(vec![]);
-            }
-        };
+        if self.pm_type == PackageManager::None {
+            return Ok(vec![]);
+        }
 
-        debug!("Executing {} env list", cmd_name);
+        debug!("Executing {} env list", self.pm_type);
 
-        // Execute conda env list
-        let output = tokio::process::Command::new(cmd_name)
-            .args(&["env", "list"])
-            .output()
-            .await
-            .map_err(|e| EnvError::Execution(format!("Failed to execute {}: {}", cmd_name, e)))?;
+        let mut cmd = tokio::process::Command::new(&self.pm_path);
+        cmd.arg("env").arg("list");
+        self.apply_env_to_command(&mut cmd);
+
+        let output = cmd.output().await.map_err(|e| {
+            EnvError::Execution(format!("Failed to execute {}: {}", self.pm_type, e))
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EnvError::Execution(format!(
-                "Failed to list environments: {}",
-                stderr
+                "Failed to list environments via {}: {}",
+                self.pm_type, stderr
             )));
         }
 
-        // Parse the output
-        parse_conda_env_list(&output.stdout)
+        let mut environments = parse_conda_env_list(&output.stdout)?;
+        let source = self.pm_type.to_string();
+        for environment in &mut environments {
+            environment.source = Some(source.clone());
+        }
+
+        Ok(environments)
     }
 }
 
@@ -1843,6 +1892,12 @@ pub struct CondaEnvironment {
     pub prefix: String,
     /// Whether this environment is currently active
     pub is_active: bool,
+    /// Source backend or package manager that reported this environment
+    pub source: Option<String>,
+    /// Ownership authority for this environment
+    pub owner: Option<String>,
+    /// Original package manager source when a foreign environment was adopted by rattler
+    pub adopted_from: Option<String>,
 }
 
 /// Parse conda env list output
@@ -1893,6 +1948,9 @@ fn parse_conda_env_list(output: &[u8]) -> Result<Vec<CondaEnvironment>> {
                 name,
                 prefix,
                 is_active,
+                source: None,
+                owner: None,
+                adopted_from: None,
             });
         }
     }

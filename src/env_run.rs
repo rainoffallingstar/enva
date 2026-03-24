@@ -269,7 +269,7 @@ async fn resolve_environment_by_name(
 
             if prefixes.is_empty() {
                 return Err(EnvError::Execution(format!(
-                    "Environment '{}' was not found in configured rattler roots",
+                    "Environment '{}' was not found in accessible environment prefixes",
                     env_name
                 )));
             }
@@ -288,7 +288,7 @@ async fn resolve_environment_by_name(
             let selected = candidates[0].clone();
             if candidates.len() > 1 {
                 warn!(
-                    "Environment '{}' was found in multiple rattler prefixes. Using {}:{} (candidates: {})",
+                    "Environment '{}' was found in multiple accessible prefixes. Using {}:{} (candidates: {})",
                     env_name,
                     backend_label(selected.backend_kind, selected.package_manager),
                     selected.prefix.display(),

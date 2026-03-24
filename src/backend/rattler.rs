@@ -1,6 +1,12 @@
 use super::{BackendKind, EnvironmentBackend, EnvironmentTarget, OutputMode, RunRequest};
 use crate::error::{EnvError, Result};
-use crate::micromamba::{CondaEnvironment, ValidationDetails, ValidationResult};
+use crate::micromamba::{CondaEnvironment, MicromambaManager, ValidationDetails, ValidationResult};
+use crate::ownership::{read_ownership_record, write_rattler_ownership_record};
+use crate::package_manager::{PackageManager, PackageManagerDetector};
+use crate::prefix_registry::{
+    discover_cli_environments, merge_discovered_environments, DiscoveredEnvironment,
+    EnvironmentOwner, EnvironmentSource,
+};
 use async_trait::async_trait;
 use rattler::install::Installer;
 use rattler_conda_types::{
@@ -10,6 +16,7 @@ use rattler_repodata_gateway::{Gateway, RepoData};
 use rattler_solve::{resolvo::Solver as RattlerSolver, SolverImpl, SolverTask};
 use rattler_virtual_packages::{VirtualPackage, VirtualPackageOverrides};
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -111,13 +118,6 @@ impl RattlerBackend {
         }
 
         Ok(self.preferred_root_prefix().join("envs").join(env_name))
-    }
-
-    fn not_implemented(operation: &str) -> EnvError {
-        EnvError::Execution(format!(
-            "rattler backend is experimental; {} is not implemented yet",
-            operation
-        ))
     }
 
     fn parse_environment_yaml(yaml_file: &Path) -> Result<EnvironmentYaml> {
@@ -266,16 +266,101 @@ impl RattlerBackend {
             .to_string()
     }
 
-    fn environment_name_matches(&self, prefix: &Path, env_name: &str) -> bool {
-        if env_name == "base" && self.root_prefixes.iter().any(|root| root == prefix) {
-            return true;
-        }
+    fn owned_environment_records(&self) -> Result<Vec<DiscoveredEnvironment>> {
+        let active_prefix = std::env::var("CONDA_PREFIX").ok();
 
-        prefix
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name == env_name)
-            .unwrap_or(false)
+        Ok(self
+            .list_environment_prefixes()?
+            .into_iter()
+            .map(|prefix| {
+                let adopted_from = read_ownership_record(&prefix)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.adopted_from)
+                    .and_then(|source| EnvironmentSource::from_label(&source));
+
+                DiscoveredEnvironment {
+                    name: self.environment_name_for_prefix(&prefix),
+                    is_active: active_prefix
+                        .as_deref()
+                        .map(|active| Path::new(active) == prefix)
+                        .unwrap_or(false),
+                    prefix,
+                    source: EnvironmentSource::Rattler,
+                    owner: EnvironmentOwner::Rattler,
+                    adopted_from,
+                }
+            })
+            .collect())
+    }
+
+    async fn accessible_environment_records(&self) -> Result<Vec<DiscoveredEnvironment>> {
+        let owned = self.owned_environment_records()?;
+        let external = discover_cli_environments().await?;
+        Ok(merge_discovered_environments(owned, external))
+    }
+
+    async fn remove_foreign_environment(
+        &self,
+        environment: &DiscoveredEnvironment,
+        output_mode: OutputMode,
+    ) -> Result<()> {
+        match environment.source {
+            EnvironmentSource::PackageManager(package_manager) => {
+                let manager =
+                    MicromambaManager::new_runtime_with_package_manager(package_manager).await?;
+                manager
+                    .remove_environment_by_prefix_with_output(&environment.prefix, output_mode)
+                    .await
+            }
+            EnvironmentSource::Rattler => Err(EnvError::Execution(format!(
+                "Refusing to remove rattler-owned environment '{}' as a foreign conflict",
+                environment.prefix.display()
+            ))),
+        }
+    }
+
+    fn source_priority(source: &EnvironmentSource) -> u8 {
+        match source {
+            EnvironmentSource::Rattler => 0,
+            EnvironmentSource::PackageManager(PackageManager::Micromamba) => 1,
+            EnvironmentSource::PackageManager(PackageManager::Mamba) => 2,
+            EnvironmentSource::PackageManager(PackageManager::Conda) => 3,
+            EnvironmentSource::PackageManager(PackageManager::None) => 4,
+        }
+    }
+
+    fn source_label(source: &EnvironmentSource) -> String {
+        match source {
+            EnvironmentSource::Rattler => "rattler".to_string(),
+            EnvironmentSource::PackageManager(package_manager) => package_manager.to_string(),
+        }
+    }
+
+    fn management_priority(environment: &DiscoveredEnvironment) -> (u8, u8, String) {
+        (
+            if environment.rattler_managed() { 0 } else { 1 },
+            Self::source_priority(&environment.source),
+            environment.prefix.display().to_string(),
+        )
+    }
+
+    fn prioritize_named_records(
+        env_name: &str,
+        records: Vec<DiscoveredEnvironment>,
+    ) -> Vec<DiscoveredEnvironment> {
+        let mut matches = records
+            .into_iter()
+            .filter(|environment| environment.name == env_name)
+            .collect::<Vec<DiscoveredEnvironment>>();
+
+        matches.sort_by(|left, right| {
+            Self::management_priority(left)
+                .cmp(&Self::management_priority(right))
+                .then(left.prefix.cmp(&right.prefix))
+        });
+
+        matches
     }
 
     fn list_environment_prefixes(&self) -> Result<Vec<PathBuf>> {
@@ -317,28 +402,213 @@ impl RattlerBackend {
         Ok(Self::dedupe_paths(prefixes))
     }
 
-    async fn resolve_unique_prefix_by_name(&self, env_name: &str) -> Result<PathBuf> {
-        let matches = self.find_environment_prefixes(env_name).await?;
+    fn helper_package_manager(environment: &DiscoveredEnvironment) -> Option<PackageManager> {
+        environment
+            .adopted_from
+            .as_ref()
+            .or(Some(&environment.source))
+            .and_then(|source| match source {
+                EnvironmentSource::PackageManager(package_manager)
+                    if *package_manager != PackageManager::None =>
+                {
+                    Some(*package_manager)
+                }
+                _ => None,
+            })
+    }
+
+    async fn helper_manager_for_environment(
+        &self,
+        environment: &DiscoveredEnvironment,
+    ) -> Result<MicromambaManager> {
+        if let Some(package_manager) = Self::helper_package_manager(environment) {
+            return MicromambaManager::new_runtime_with_package_manager(package_manager).await;
+        }
+
+        let detector = PackageManagerDetector::new();
+        let package_manager = detector
+            .available_managers_with_env_override()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                EnvError::Execution(
+                    "No helper package manager is available for this rattler-managed operation"
+                        .to_string(),
+                )
+            })?;
+
+        MicromambaManager::new_runtime_with_package_manager(package_manager).await
+    }
+
+    async fn adopt_discovered_environment(
+        &self,
+        environment: &DiscoveredEnvironment,
+        output_mode: OutputMode,
+    ) -> Result<DiscoveredEnvironment> {
+        if environment.rattler_managed() {
+            return Ok(environment.clone());
+        }
+
+        let adopted_from = environment
+            .adopted_from_label()
+            .or_else(|| match &environment.source {
+                EnvironmentSource::PackageManager(package_manager) => {
+                    Some(package_manager.to_string())
+                }
+                EnvironmentSource::Rattler => None,
+            });
+        write_rattler_ownership_record(&environment.prefix, adopted_from.as_deref())?;
+
+        if matches!(output_mode, OutputMode::Summary | OutputMode::Stream) {
+            println!(
+                "Adopted environment '{}' at {} into rattler ownership{}",
+                environment.name,
+                environment.prefix.display(),
+                adopted_from
+                    .as_ref()
+                    .map(|source| format!(" (source: {})", source))
+                    .unwrap_or_default()
+            );
+        }
+
+        let mut adopted = environment.clone();
+        adopted.owner = EnvironmentOwner::Rattler;
+        adopted.adopted_from = adopted_from
+            .as_deref()
+            .and_then(EnvironmentSource::from_label);
+        Ok(adopted)
+    }
+
+    async fn resolve_record_by_prefix(&self, prefix: &Path) -> Result<DiscoveredEnvironment> {
+        let matches = self
+            .accessible_environment_records()
+            .await?
+            .into_iter()
+            .filter(|environment| environment.prefix == prefix)
+            .collect::<Vec<DiscoveredEnvironment>>();
+
+        match matches.as_slice() {
+            [environment] => Ok(environment.clone()),
+            [] if Self::is_environment_prefix(prefix) => {
+                let active_prefix = std::env::var("CONDA_PREFIX").ok();
+                let adopted_from = read_ownership_record(prefix)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.adopted_from)
+                    .and_then(|source| EnvironmentSource::from_label(&source));
+                Ok(DiscoveredEnvironment {
+                    name: self.environment_name_for_prefix(prefix),
+                    prefix: prefix.to_path_buf(),
+                    is_active: active_prefix
+                        .as_deref()
+                        .map(|active| Path::new(active) == prefix)
+                        .unwrap_or(false),
+                    source: EnvironmentSource::PackageManager(PackageManager::None),
+                    owner: if adopted_from.is_some() {
+                        EnvironmentOwner::Rattler
+                    } else {
+                        EnvironmentOwner::External
+                    },
+                    adopted_from,
+                })
+            }
+            [] => Err(EnvError::Execution(format!(
+                "Environment prefix was not found in accessible environment prefixes: {}",
+                prefix.display()
+            ))),
+            _ => Err(EnvError::Execution(format!(
+                "Environment prefix matched multiple records: {}",
+                prefix.display()
+            ))),
+        }
+    }
+
+    async fn resolve_unique_record_by_name(&self, env_name: &str) -> Result<DiscoveredEnvironment> {
+        let matches =
+            Self::prioritize_named_records(env_name, self.accessible_environment_records().await?);
 
         match matches.as_slice() {
             [] => Err(EnvError::Execution(format!(
-                "Environment '{}' was not found in configured rattler roots",
+                "Environment '{}' was not found in accessible environment prefixes",
                 env_name
             ))),
-            [prefix] => Ok(prefix.clone()),
+            [environment] => Ok(environment.clone()),
             _ => Err(EnvError::Execution(format!(
-                "Environment '{}' matched multiple rattler prefixes: {}. Use --prefix to disambiguate.",
+                "Environment '{}' matched multiple accessible prefixes: {}. Use --prefix to disambiguate.",
                 env_name,
                 matches
                     .iter()
-                    .map(|prefix| prefix.display().to_string())
+                    .map(|environment| environment.prefix.display().to_string())
                     .collect::<Vec<String>>()
                     .join(", ")
             ))),
         }
     }
 
-    fn build_prefixed_path(&self, prefix: &Path) -> Result<std::ffi::OsString> {
+    async fn ensure_adopted_environment(
+        &self,
+        target: &EnvironmentTarget,
+        output_mode: OutputMode,
+    ) -> Result<DiscoveredEnvironment> {
+        let environment = match target {
+            EnvironmentTarget::Name(env_name) => {
+                self.resolve_unique_record_by_name(env_name).await?
+            }
+            EnvironmentTarget::Prefix(prefix) => self.resolve_record_by_prefix(prefix).await?,
+        };
+
+        if environment.rattler_managed() {
+            return Ok(environment);
+        }
+
+        self.adopt_discovered_environment(&environment, output_mode)
+            .await
+    }
+
+    fn cache_root_dir() -> Result<PathBuf> {
+        rattler::default_cache_dir().map_err(|error| {
+            EnvError::Environment(format!(
+                "Failed to determine rattler cache directory: {}",
+                error
+            ))
+        })
+    }
+
+    fn cache_directory_entries(cache_root: &Path) -> Vec<(&'static str, PathBuf)> {
+        vec![
+            ("packages", cache_root.join("pkgs")),
+            ("repodata", cache_root.join("repodata")),
+            ("run-exports", cache_root.join("run-exports")),
+        ]
+    }
+
+    async fn clear_cache_directory(path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+
+        if path.is_dir() {
+            async_fs::remove_dir_all(path).await.map_err(|error| {
+                EnvError::FileOperation(format!(
+                    "Failed to remove rattler cache directory {}: {}",
+                    path.display(),
+                    error
+                ))
+            })?;
+        } else {
+            async_fs::remove_file(path).await.map_err(|error| {
+                EnvError::FileOperation(format!(
+                    "Failed to remove rattler cache file {}: {}",
+                    path.display(),
+                    error
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn build_prefixed_path(&self, prefix: &Path) -> Result<OsString> {
         let mut path_entries = Vec::new();
         path_entries.push(prefix.join("bin"));
 
@@ -436,13 +706,51 @@ impl EnvironmentBackend for RattlerBackend {
     }
 
     async fn clean_package_cache(&self, dry_run: bool, output_mode: OutputMode) -> Result<()> {
-        if matches!(output_mode, OutputMode::Summary) {
-            if dry_run {
-                println!("[DRY-RUN] rattler backend cache cleanup is currently a no-op");
+        let cache_root = Self::cache_root_dir()?;
+        let cache_directories = Self::cache_directory_entries(&cache_root);
+
+        if dry_run {
+            if matches!(output_mode, OutputMode::Summary | OutputMode::Stream) {
+                println!(
+                    "[DRY-RUN] Would clean rattler caches under {}",
+                    cache_root.display()
+                );
+                for (label, path) in &cache_directories {
+                    println!("  - {}: {}", label, path.display());
+                }
+            }
+            return Ok(());
+        }
+
+        if matches!(output_mode, OutputMode::Summary | OutputMode::Stream) {
+            println!("Cleaning rattler caches under {}", cache_root.display());
+        }
+
+        let mut removed = Vec::new();
+        let mut missing = Vec::new();
+        for (label, path) in cache_directories {
+            if path.exists() {
+                Self::clear_cache_directory(&path).await?;
+                removed.push((label, path));
             } else {
-                println!("⚠ rattler backend cache cleanup is not implemented yet; skipping");
+                missing.push((label, path));
             }
         }
+
+        if matches!(output_mode, OutputMode::Summary | OutputMode::Stream) {
+            for (label, path) in &removed {
+                println!("  ✓ Removed {} cache: {}", label, path.display());
+            }
+            if matches!(output_mode, OutputMode::Stream) {
+                for (label, path) in &missing {
+                    println!("  - No {} cache present: {}", label, path.display());
+                }
+            }
+            if matches!(output_mode, OutputMode::Summary) {
+                println!("✓ Rattler cache cleanup complete");
+            }
+        }
+
         Ok(())
     }
 
@@ -469,6 +777,60 @@ impl EnvironmentBackend for RattlerBackend {
         }
 
         let target_prefix = self.target_prefix_for_env_name(env_name)?;
+        let conflicting_environments =
+            Self::prioritize_named_records(env_name, self.accessible_environment_records().await?)
+                .into_iter()
+                .filter(|environment| environment.prefix != target_prefix)
+                .collect::<Vec<DiscoveredEnvironment>>();
+
+        let owned_conflicts = conflicting_environments
+            .iter()
+            .filter(|environment| environment.rattler_managed())
+            .collect::<Vec<&DiscoveredEnvironment>>();
+        if !owned_conflicts.is_empty() {
+            return Err(EnvError::Execution(format!(
+                "Environment '{}' already exists in other rattler-owned prefixes: {}. Use --prefix to disambiguate.",
+                env_name,
+                owned_conflicts
+                    .iter()
+                    .map(|environment| environment.prefix.display().to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            )));
+        }
+
+        if !conflicting_environments.is_empty() {
+            if !force {
+                return Err(EnvError::Execution(format!(
+                    "Environment '{}' already exists in other tool-managed prefixes: {}. Re-run with --force to remove them via their original package manager before recreating with rattler.",
+                    env_name,
+                    conflicting_environments
+                        .iter()
+                        .map(|environment| environment.prefix.display().to_string())
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                )));
+            }
+
+            for environment in &conflicting_environments {
+                if matches!(output_mode, OutputMode::Summary | OutputMode::Stream) {
+                    println!(
+                        "Removing conflicting {} environment '{}' at {} before rattler create...",
+                        match environment.source {
+                            EnvironmentSource::PackageManager(package_manager) => {
+                                package_manager.to_string()
+                            }
+                            EnvironmentSource::Rattler => "rattler".to_string(),
+                        },
+                        env_name,
+                        environment.prefix.display()
+                    );
+                }
+                self.remove_foreign_environment(environment, output_mode)
+                    .await?;
+            }
+        }
+
         if target_prefix.exists() {
             if Self::is_environment_prefix(&target_prefix) {
                 if force {
@@ -528,6 +890,8 @@ impl EnvironmentBackend for RattlerBackend {
                 ))
             })?;
 
+        write_rattler_ownership_record(&target_prefix, None)?;
+
         if matches!(output_mode, OutputMode::Summary) {
             println!("✓ Environment {} created", env_name);
         }
@@ -564,8 +928,26 @@ impl EnvironmentBackend for RattlerBackend {
         Ok(!self.find_environment_prefixes(env_name).await?.is_empty())
     }
 
-    async fn install_packages(&self, _env_name: &str, _packages: &[String]) -> Result<()> {
-        Err(Self::not_implemented("install_packages"))
+    async fn install_packages(&self, env_name: &str, packages: &[String]) -> Result<()> {
+        let environment = self
+            .ensure_adopted_environment(
+                &EnvironmentTarget::Name(env_name.to_string()),
+                OutputMode::Summary,
+            )
+            .await?;
+        let manager = self.helper_manager_for_environment(&environment).await?;
+        manager
+            .install_packages_by_prefix(&environment.prefix, packages)
+            .await
+    }
+
+    async fn adopt_environment(
+        &self,
+        target: &EnvironmentTarget,
+        output_mode: OutputMode,
+    ) -> Result<()> {
+        self.ensure_adopted_environment(target, output_mode).await?;
+        Ok(())
     }
 
     async fn remove_environment_with_output(
@@ -573,48 +955,70 @@ impl EnvironmentBackend for RattlerBackend {
         env_name: &str,
         output_mode: OutputMode,
     ) -> Result<()> {
-        let prefix = self.resolve_unique_prefix_by_name(env_name).await?;
+        let environment = self
+            .ensure_adopted_environment(&EnvironmentTarget::Name(env_name.to_string()), output_mode)
+            .await?;
+        let prefix = environment.prefix.clone();
         if self.root_prefixes.iter().any(|root| root == &prefix) {
             return Err(EnvError::Execution(
                 "Refusing to remove the rattler base environment".to_string(),
             ));
         }
 
-        if matches!(output_mode, OutputMode::Stream | OutputMode::Summary) {
-            println!(
-                "Removing rattler environment '{}' at {}",
-                env_name,
-                prefix.display()
-            );
-        }
+        if let Some(_) = Self::helper_package_manager(&environment) {
+            if matches!(output_mode, OutputMode::Stream | OutputMode::Summary) {
+                println!(
+                    "Removing adopted environment '{}' at {} via helper package manager",
+                    env_name,
+                    prefix.display()
+                );
+            }
+            let manager = self.helper_manager_for_environment(&environment).await?;
+            manager
+                .remove_environment_by_prefix_with_output(&prefix, output_mode)
+                .await?;
+        } else {
+            if matches!(output_mode, OutputMode::Stream | OutputMode::Summary) {
+                println!(
+                    "Removing rattler environment '{}' at {}",
+                    env_name,
+                    prefix.display()
+                );
+            }
 
-        async_fs::remove_dir_all(&prefix).await.map_err(|error| {
-            EnvError::FileOperation(format!(
-                "Failed to remove rattler environment {}: {}",
-                prefix.display(),
-                error
-            ))
-        })?;
+            async_fs::remove_dir_all(&prefix).await.map_err(|error| {
+                EnvError::FileOperation(format!(
+                    "Failed to remove rattler environment {}: {}",
+                    prefix.display(),
+                    error
+                ))
+            })?;
 
-        if matches!(output_mode, OutputMode::Summary) {
-            println!("✓ Environment {} removed", env_name);
+            if matches!(output_mode, OutputMode::Summary) {
+                println!("✓ Environment {} removed", env_name);
+            }
         }
 
         Ok(())
     }
 
     async fn get_all_conda_environments(&self) -> Result<Vec<CondaEnvironment>> {
-        let active_prefix = std::env::var("CONDA_PREFIX").ok();
         let mut environments = self
-            .list_environment_prefixes()?
+            .accessible_environment_records()
+            .await?
             .into_iter()
-            .map(|prefix| CondaEnvironment {
-                name: self.environment_name_for_prefix(&prefix),
-                is_active: active_prefix
-                    .as_deref()
-                    .map(|active| Path::new(active) == prefix)
-                    .unwrap_or(false),
-                prefix: prefix.display().to_string(),
+            .map(|environment| {
+                let source = Self::source_label(&environment.source);
+                let owner = environment.owner_label().to_string();
+                let adopted_from = environment.adopted_from_label();
+                CondaEnvironment {
+                    name: environment.name,
+                    is_active: environment.is_active,
+                    prefix: environment.prefix.display().to_string(),
+                    source: Some(source),
+                    owner: Some(owner),
+                    adopted_from,
+                }
             })
             .collect::<Vec<CondaEnvironment>>();
 
@@ -627,21 +1031,20 @@ impl EnvironmentBackend for RattlerBackend {
     }
 
     async fn find_environment_prefixes(&self, env_name: &str) -> Result<Vec<PathBuf>> {
-        Ok(self
-            .list_environment_prefixes()?
-            .into_iter()
-            .filter(|prefix| self.environment_name_matches(prefix, env_name))
-            .collect())
+        Ok(
+            Self::prioritize_named_records(env_name, self.accessible_environment_records().await?)
+                .into_iter()
+                .map(|environment| environment.prefix)
+                .collect(),
+        )
     }
 
     async fn run(&self, target: &EnvironmentTarget, request: &RunRequest) -> Result<()> {
-        let prefix = match target {
-            EnvironmentTarget::Name(env_name) => {
-                self.resolve_unique_prefix_by_name(env_name).await?
-            }
-            EnvironmentTarget::Prefix(prefix) => prefix.clone(),
-        };
-        self.run_command_in_prefix(&prefix, request).await
+        let environment = self
+            .ensure_adopted_environment(target, OutputMode::Summary)
+            .await?;
+        self.run_command_in_prefix(&environment.prefix, request)
+            .await
     }
 }
 
@@ -649,9 +1052,17 @@ impl EnvironmentBackend for RattlerBackend {
 mod tests {
     use super::RattlerBackend;
     use crate::backend::{EnvironmentBackend, EnvironmentTarget, OutputMode, RunRequest};
+    use crate::package_manager::PackageManager;
+    use crate::prefix_registry::{DiscoveredEnvironment, EnvironmentOwner, EnvironmentSource};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn backend_with_root(root: &Path) -> RattlerBackend {
         RattlerBackend::with_root_prefixes(vec![root.to_path_buf()])
@@ -666,6 +1077,20 @@ mod tests {
         .unwrap();
     }
 
+    fn discovered_environment(
+        name: &str,
+        prefix: &str,
+        source: EnvironmentSource,
+    ) -> DiscoveredEnvironment {
+        DiscoveredEnvironment {
+            name: name.to_string(),
+            prefix: PathBuf::from(prefix),
+            is_active: false,
+            source,
+            owner: EnvironmentOwner::External,
+            adopted_from: None,
+        }
+    }
     #[cfg(unix)]
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
@@ -768,6 +1193,83 @@ mod tests {
             .unwrap();
 
         assert!(!env_prefix.exists());
+    }
+
+    #[test]
+    fn prioritize_named_records_prefers_rattler_for_same_name() {
+        let prioritized = RattlerBackend::prioritize_named_records(
+            "demo",
+            vec![
+                discovered_environment(
+                    "demo",
+                    "/tmp/external-demo",
+                    EnvironmentSource::PackageManager(PackageManager::Micromamba),
+                ),
+                discovered_environment("demo", "/tmp/rattler-demo", EnvironmentSource::Rattler),
+                discovered_environment(
+                    "other",
+                    "/tmp/other",
+                    EnvironmentSource::PackageManager(PackageManager::Conda),
+                ),
+            ],
+        );
+
+        assert_eq!(prioritized.len(), 2);
+        assert_eq!(prioritized[0].source, EnvironmentSource::Rattler);
+        assert_eq!(prioritized[0].prefix, PathBuf::from("/tmp/rattler-demo"));
+        assert_eq!(
+            prioritized[1].source,
+            EnvironmentSource::PackageManager(PackageManager::Micromamba)
+        );
+    }
+
+    #[test]
+    fn cache_directory_entries_use_expected_subdirectories() {
+        let root = PathBuf::from("/tmp/rattler-cache-root");
+        let entries = RattlerBackend::cache_directory_entries(&root);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(label, path)| ((*label).to_string(), path.clone()))
+                .collect::<Vec<(String, PathBuf)>>(),
+            vec![
+                ("packages".to_string(), root.join("pkgs")),
+                ("repodata".to_string(), root.join("repodata")),
+                ("run-exports".to_string(), root.join("run-exports")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_package_cache_removes_rattler_cache_directories() {
+        let _guard = env_lock().lock().unwrap();
+        let previous = std::env::var_os("RATTLER_CACHE_DIR");
+        let tempdir = tempdir().unwrap();
+        let cache_root = tempdir.path().join("rattler-cache");
+        for (_, path) in RattlerBackend::cache_directory_entries(&cache_root) {
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("marker.txt"), "cached\n").unwrap();
+        }
+        std::env::set_var("RATTLER_CACHE_DIR", &cache_root);
+
+        let backend = RattlerBackend::new();
+        backend
+            .clean_package_cache(false, OutputMode::Quiet)
+            .await
+            .unwrap();
+
+        for (_, path) in RattlerBackend::cache_directory_entries(&cache_root) {
+            assert!(
+                !path.exists(),
+                "cache path should be removed: {}",
+                path.display()
+            );
+        }
+
+        match previous {
+            Some(value) => std::env::set_var("RATTLER_CACHE_DIR", value),
+            None => std::env::remove_var("RATTLER_CACHE_DIR"),
+        }
     }
 
     #[cfg(unix)]

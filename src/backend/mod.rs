@@ -30,6 +30,12 @@ pub trait EnvironmentBackend: Send + Sync {
 
     async fn install_packages(&self, env_name: &str, packages: &[String]) -> Result<()>;
 
+    async fn adopt_environment(
+        &self,
+        target: &EnvironmentTarget,
+        output_mode: OutputMode,
+    ) -> Result<()>;
+
     async fn remove_environment_with_output(
         &self,
         env_name: &str,
