@@ -2,9 +2,22 @@
 
 use crate::error::{Result, EnvError};
 use crate::micromamba::MicromambaManager;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputMode {
+    Stream,
+    Summary,
+    Quiet,
+}
+
+impl Default for OutputMode {
+    fn default() -> Self {
+        Self::Summary
+    }
+}
 
 /// Environment management arguments
 #[derive(Debug, Clone, Args)]
@@ -60,6 +73,10 @@ pub struct EnvCreateArgs {
     /// Clean conda package caches before creating environments
     #[arg(long)]
     pub clean_cache: bool,
+
+    /// Terminal output mode: stream full logs, show a concise summary, or stay quiet
+    #[arg(long, value_enum, default_value_t = OutputMode::Summary)]
+    pub output: OutputMode,
 }
 
 /// Environment validation arguments
@@ -278,7 +295,7 @@ async fn execute_env_create(
 
     if args.clean_cache {
         let manager = micromamba_manager.lock().await;
-        manager.clean_package_cache(dry_run).await?;
+        manager.clean_package_cache(dry_run, args.output).await?;
     }
 
     for env_name in environments_to_create {
@@ -323,7 +340,7 @@ async fn execute_env_create(
         };
 
         match manager
-            .create_environment(env_name, &yaml_file, dry_run, args.force)
+            .create_environment(env_name, &yaml_file, dry_run, args.force, args.output)
             .await
         {
             Ok(_) => {

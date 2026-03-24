@@ -12,6 +12,7 @@
 //! - Cross-platform support (Linux/macOS)
 //! - Performance: 2-3x faster than conda
 
+use crate::env::OutputMode;
 use crate::error::{Result, EnvError};
 use crate::package_manager::{PackageManager, PackageManagerDetector};
 use async_trait::async_trait;
@@ -998,14 +999,34 @@ impl MicromambaManager {
         Ok(output.status.success())
     }
 
-    /// Clean package caches before environment creation
-    pub async fn clean_package_cache(&self, dry_run: bool) -> Result<()> {
+    fn summary_spinner(message: impl Into<String>) -> Result<ProgressBar> {
+        let pb = ProgressBar::new_spinner();
+        let style = ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .map_err(|e| EnvError::Template(format!("Failed to create progress bar: {}", e)))?
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+        pb.set_style(style);
+        pb.set_message(message.into());
+        pb.enable_steady_tick(Duration::from_millis(120));
+        Ok(pb)
+    }
+
+    pub async fn clean_package_cache(&self, dry_run: bool, output_mode: OutputMode) -> Result<()> {
         if dry_run {
             info!("Dry-run: would clean package caches using {}", self.pm_type);
             return Ok(());
         }
 
         info!("Cleaning package caches using {}...", self.pm_type);
+        let progress = if matches!(output_mode, OutputMode::Summary) {
+            Some(Self::summary_spinner(format!(
+                "Cleaning {} package caches...",
+                self.pm_type
+            ))?)
+        } else {
+            None
+        };
+
         let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("clean").arg("--all");
 
@@ -1023,20 +1044,49 @@ impl MicromambaManager {
             }
         }
 
-        cmd.stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit());
-
-        self.apply_env_to_command(&mut cmd);
-
-        let output = cmd.output().await.map_err(|e| {
-            EnvError::Execution(format!("Failed to clean package caches: {}", e))
-        })?;
+        let output = match output_mode {
+            OutputMode::Stream => {
+                if let Some(pb) = &progress {
+                    pb.finish_and_clear();
+                }
+                cmd.stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit());
+                self.apply_env_to_command(&mut cmd);
+                let status = cmd.status().await.map_err(|e| {
+                    EnvError::Execution(format!("Failed to clean package caches: {}", e))
+                })?;
+                std::process::Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }
+            }
+            OutputMode::Summary | OutputMode::Quiet => {
+                cmd.stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                self.apply_env_to_command(&mut cmd);
+                let output = cmd.output().await.map_err(|e| {
+                    EnvError::Execution(format!("Failed to clean package caches: {}", e))
+                })?;
+                if let Some(pb) = &progress {
+                    pb.finish_and_clear();
+                }
+                output
+            }
+        };
 
         if !output.status.success() {
+            if !output.stderr.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            }
             return Err(EnvError::Execution(format!(
                 "Failed to clean package caches: exit code {:?}",
                 output.status.code()
             )));
+        }
+
+        if matches!(output_mode, OutputMode::Summary) {
+            println!("✓ Cleaned {} package caches", self.pm_type);
         }
 
         info!("Package caches cleaned successfully");
@@ -1050,29 +1100,43 @@ impl MicromambaManager {
         yaml_file: &Path,
         dry_run: bool,
         force: bool,
+        output_mode: OutputMode,
     ) -> Result<()> {
         let _lock = self.creation_lock.lock().await;
 
         info!("create_environment called for {:?}", yaml_file);
-        let pb = ProgressBar::new_spinner();
-        pb.enable_steady_tick(Duration::from_millis(120));
+        let progress = if matches!(output_mode, OutputMode::Summary) {
+            Some(Self::summary_spinner(format!("Preparing environment {}...", env_name))?)
+        } else {
+            None
+        };
 
         if dry_run {
-            pb.set_message("Validating YAML configuration...");
+            if let Some(pb) = &progress {
+                pb.set_message(format!("Validating YAML for {}...", env_name));
+            }
             let validation = self.validate_yaml(yaml_file).await?;
+            if let Some(pb) = &progress {
+                pb.finish_and_clear();
+            }
             println!("{}", serde_json::to_string_pretty(&validation)?);
-            pb.finish_and_clear();
             return Ok(());
         }
 
         if self.environment_exists(env_name).await? {
             if force {
+                if let Some(pb) = &progress {
+                    pb.set_message(format!("Replacing existing environment {}...", env_name));
+                }
                 info!(
                     "Environment {} already exists; removing it before recreation",
                     env_name
                 );
                 self.remove_environment(env_name).await?;
             } else {
+                if let Some(pb) = &progress {
+                    pb.finish_and_clear();
+                }
                 let error_msg = format!(
                     "Environment {} already exists. Re-run with --force to replace it.",
                     env_name
@@ -1082,12 +1146,16 @@ impl MicromambaManager {
             }
         }
 
-        pb.set_message("Validating YAML configuration...");
+        if let Some(pb) = &progress {
+            pb.set_message(format!("Validating YAML for {}...", env_name));
+        }
         info!("About to validate YAML for {:?}", yaml_file);
         let _validation = self.validate_yaml(yaml_file).await?;
         info!("YAML validation complete");
 
-        pb.set_message("Creating environment...");
+        if let Some(pb) = &progress {
+            pb.set_message(format!("Creating environment {}...", env_name));
+        }
         info!("Building micromamba command for {:?}", yaml_file);
         let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("env")
@@ -1096,32 +1164,50 @@ impl MicromambaManager {
             .arg(yaml_file)
             .arg("-n")
             .arg(env_name)
-            .arg("-y")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .arg("-y");
 
-        self.apply_env_to_command(&mut cmd);
-
-        info!("Command built, executing...");
-
-        pb.finish_and_clear();
-
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| EnvError::Execution(format!("Failed to execute micromamba: {}", e)))?;
-
-        if !output.stdout.is_empty() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            print!("{}", stdout);
-        }
-        if !output.stderr.is_empty() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprint!("{}", stderr);
-        }
+        let output = match output_mode {
+            OutputMode::Stream => {
+                if let Some(pb) = &progress {
+                    pb.finish_and_clear();
+                }
+                cmd.stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit());
+                self.apply_env_to_command(&mut cmd);
+                info!("Command built, executing with streamed output...");
+                let status = cmd.status().await.map_err(|e| {
+                    EnvError::Execution(format!("Failed to execute micromamba: {}", e))
+                })?;
+                std::process::Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }
+            }
+            OutputMode::Summary | OutputMode::Quiet => {
+                cmd.stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                self.apply_env_to_command(&mut cmd);
+                info!("Command built, executing with captured output...");
+                let output = cmd.output().await.map_err(|e| {
+                    EnvError::Execution(format!("Failed to execute micromamba: {}", e))
+                })?;
+                if let Some(pb) = &progress {
+                    pb.finish_and_clear();
+                }
+                output
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.stdout.is_empty() {
+                print!("{}", String::from_utf8_lossy(&output.stdout));
+            }
+            if !stderr.is_empty() {
+                eprint!("{}", stderr);
+            }
+
             if stderr.contains("Non-conda folder exists at prefix") {
                 let error_msg = format!(
                     "Failed to create environment: Environment directory already exists but is not a valid conda environment. Please remove the existing directory and try again, or use a different environment name."
@@ -1136,6 +1222,10 @@ impl MicromambaManager {
             );
             error!("{}", error_msg);
             return Err(EnvError::Execution(error_msg));
+        }
+
+        if matches!(output_mode, OutputMode::Summary) {
+            println!("✓ Environment {} created", env_name);
         }
 
         info!("Environment created successfully from {:?}", yaml_file);

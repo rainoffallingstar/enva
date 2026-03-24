@@ -61,6 +61,11 @@ cargo build --release
 # Replace an existing environment and clean caches first
 ./enva create --yaml ./environments/configs/xdxtools-core.yaml --name xdxtools-core --force --clean-cache
 
+# Output control
+./enva create --core --output summary   # concise spinner + final status
+./enva create --core --output stream    # real-time micromamba logs and progress
+./enva create --core --output quiet     # suppress normal create output
+
 # Dry-run validation
 ./enva --dry-run create --all
 ```
