@@ -14,7 +14,7 @@ use rattler_conda_types::{
     Channel, ChannelConfig, EnvironmentYaml, MatchSpec, Platform, RepoDataRecord,
 };
 use rattler_repodata_gateway::{Gateway, RepoData};
-use rattler_solve::{resolvo::Solver as RattlerSolver, SolverImpl, SolverTask};
+use rattler_solve::{resolvo::Solver as RattlerSolver, ChannelPriority, SolverImpl, SolverTask};
 use rattler_virtual_packages::{VirtualPackage, VirtualPackageOverrides};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -161,6 +161,10 @@ impl RattlerBackend {
         environment_yaml.match_specs().cloned().collect()
     }
 
+    fn default_channel_priority() -> ChannelPriority {
+        ChannelPriority::Disabled
+    }
+
     fn resolve_channel_config(yaml_file: &Path) -> ChannelConfig {
         let root_dir = yaml_file
             .parent()
@@ -237,6 +241,7 @@ impl RattlerBackend {
             .solve(SolverTask {
                 specs: specs.clone(),
                 virtual_packages,
+                channel_priority: Self::default_channel_priority(),
                 ..SolverTask::from_iter(repo_data_sets.iter())
             })
             .map_err(|error| {
@@ -1089,6 +1094,7 @@ mod tests {
     use crate::backend::{EnvironmentBackend, EnvironmentTarget, OutputMode, RunRequest};
     use crate::package_manager::PackageManager;
     use crate::prefix_registry::{DiscoveredEnvironment, EnvironmentOwner, EnvironmentSource};
+    use rattler_solve::ChannelPriority;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -1272,6 +1278,14 @@ mod tests {
                 ("repodata".to_string(), root.join("repodata")),
                 ("run-exports".to_string(), root.join("run-exports")),
             ]
+        );
+    }
+
+    #[test]
+    fn default_channel_priority_is_disabled() {
+        assert_eq!(
+            RattlerBackend::default_channel_priority(),
+            ChannelPriority::Disabled
         );
     }
 
