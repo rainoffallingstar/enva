@@ -13,7 +13,7 @@
 //! - Performance: 2-3x faster than conda
 
 use crate::env::OutputMode;
-use crate::error::{Result, EnvError};
+use crate::error::{EnvError, Result};
 use crate::package_manager::{PackageManager, PackageManagerDetector};
 use async_trait::async_trait;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -34,7 +34,8 @@ use tracing::{debug, error, info, warn};
 use which::which;
 
 /// Global micromamba manager instance (lazy initialization)
-static GLOBAL_MANAGER: LazyLock<Mutex<Option<MicromambaManager>>> = LazyLock::new(|| Mutex::new(None));
+static GLOBAL_MANAGER: LazyLock<Mutex<Option<MicromambaManager>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Track whether global manager has been initialized (to control logging)
 static GLOBAL_INITIALIZED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
@@ -61,7 +62,6 @@ pub const TOOL_ENVIRONMENT_MAP: &[(&str, &str)] = &[
     ("macs2", "xdxtools-core"),
     ("bwa", "xdxtools-core"),
     ("bowtie2", "xdxtools-core"),
-    ("phantompeakqualtools", "xdxtools-core"),
     ("bwa-index", "xdxtools-core"),     // BWA index building
     ("bowtie2-build", "xdxtools-core"), // Bowtie2 index building
     // Qualimap -> xdxtools-core
@@ -247,9 +247,8 @@ impl MicromambaManager {
         let pm_path = match pm_type {
             PackageManager::Conda | PackageManager::Mamba => {
                 // conda/mamba usually in PATH
-                which(pm_type.command()).map_err(|_| {
-                    EnvError::Config(format!("{} not found in PATH", pm_type))
-                })?
+                which(pm_type.command())
+                    .map_err(|_| EnvError::Config(format!("{} not found in PATH", pm_type)))?
             }
             PackageManager::Micromamba => {
                 // micromamba might need to be downloaded
@@ -257,7 +256,7 @@ impl MicromambaManager {
             }
             PackageManager::None => {
                 return Err(EnvError::Config(
-                    "No package manager found (conda/mamba/micromamba)".to_string()
+                    "No package manager found (conda/mamba/micromamba)".to_string(),
                 ));
             }
         };
@@ -382,21 +381,13 @@ impl MicromambaManager {
         let new_ld_path = if existing_ld_path.is_empty() {
             lib_dir.to_string_lossy().to_string()
         } else {
-            format!(
-                "{}:{}",
-                lib_dir.to_string_lossy(),
-                existing_ld_path
-            )
+            format!("{}:{}", lib_dir.to_string_lossy(), existing_ld_path)
         };
         env_vars.insert("LD_LIBRARY_PATH".to_string(), new_ld_path);
 
         // Set PATH - put micromamba's bin directory FIRST to ensure it's used instead of conda
         let existing_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!(
-            "{}:{}",
-            pm_dir.to_string_lossy(),
-            existing_path
-        );
+        let new_path = format!("{}:{}", pm_dir.to_string_lossy(), existing_path);
         env_vars.insert("PATH".to_string(), new_path);
 
         // Also ensure we explicitly set the micromamba path to avoid PATH resolution issues
@@ -476,11 +467,17 @@ impl MicromambaManager {
         }
 
         if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
-            return Ok(PathBuf::from(data_home).join("micromamba").join("micromamba"));
+            return Ok(PathBuf::from(data_home)
+                .join("micromamba")
+                .join("micromamba"));
         }
 
         if let Some(home) = dirs::home_dir() {
-            return Ok(home.join(".local").join("share").join("micromamba").join("micromamba"));
+            return Ok(home
+                .join(".local")
+                .join("share")
+                .join("micromamba")
+                .join("micromamba"));
         }
 
         // Fallback to executable directory
@@ -494,7 +491,7 @@ impl MicromambaManager {
         }
 
         Err(EnvError::FileOperation(
-            "Could not determine installation directory for micromamba".to_string()
+            "Could not determine installation directory for micromamba".to_string(),
         ))
     }
 
@@ -810,10 +807,8 @@ impl MicromambaManager {
                         if nested_binary.exists() {
                             info!("Detected nested directory structure, moving binary to correct location...");
                             // Create a temporary path for the binary
-                            let temp_binary_path = binary_path
-                                .parent()
-                                .unwrap()
-                                .join("micromamba.tmp");
+                            let temp_binary_path =
+                                binary_path.parent().unwrap().join("micromamba.tmp");
 
                             // First copy to a temporary location
                             if let Err(e) = fs::copy(&nested_binary, &temp_binary_path) {
@@ -834,7 +829,9 @@ impl MicromambaManager {
                                             if let Ok(metadata) = fs::metadata(&binary_path) {
                                                 let mut perms = metadata.permissions();
                                                 perms.set_mode(0o755);
-                                                if let Err(e) = fs::set_permissions(&binary_path, perms) {
+                                                if let Err(e) =
+                                                    fs::set_permissions(&binary_path, perms)
+                                                {
                                                     warn!(
                                                         "Failed to set execute permissions: {}",
                                                         e
@@ -873,11 +870,7 @@ impl MicromambaManager {
         self.auto_copy_config_templates(verbose).await?;
 
         // Load environment configurations
-        let env_names = [
-            "xdxtools-core",
-            "xdxtools-snakemake",
-            "xdxtools-extra",
-        ];
+        let env_names = ["xdxtools-core", "xdxtools-snakemake", "xdxtools-extra"];
 
         for env_name in &env_names {
             let env_file = self.config_dir.join(format!("{}.yaml", env_name));
@@ -1106,7 +1099,10 @@ impl MicromambaManager {
 
         info!("create_environment called for {:?}", yaml_file);
         let progress = if matches!(output_mode, OutputMode::Summary) {
-            Some(Self::summary_spinner(format!("Preparing environment {}...", env_name))?)
+            Some(Self::summary_spinner(format!(
+                "Preparing environment {}...",
+                env_name
+            ))?)
         } else {
             None
         };
@@ -1132,7 +1128,8 @@ impl MicromambaManager {
                     "Environment {} already exists; removing it before recreation",
                     env_name
                 );
-                self.remove_environment(env_name).await?;
+                self.remove_environment_with_output(env_name, output_mode)
+                    .await?;
             } else {
                 if let Some(pb) = &progress {
                     pb.finish_and_clear();
@@ -1267,9 +1264,12 @@ impl MicromambaManager {
             env_cmd.push_str(&format!("export {}={}; ", key, value));
         }
         // Use micromamba directly (not through bash -c which causes issues with --no-capture-output)
-        env_cmd.push_str(&format!("{} run -n {} {}",
-            self.pm_path.to_string_lossy(), env_name, command));
-
+        env_cmd.push_str(&format!(
+            "{} run -n {} {}",
+            self.pm_path.to_string_lossy(),
+            env_name,
+            command
+        ));
 
         // Use bash -c to execute with our environment
         let mut cmd = AsyncCommand::new("bash");
@@ -1288,38 +1288,39 @@ impl MicromambaManager {
         }
 
         // Execute command
-        let output = if capture_output {
-            // Capture output to display it
-            let output = cmd.output().await.map_err(|e| {
-                EnvError::Execution(format!("Failed to execute command: {}", e))
-            })?;
+        let output =
+            if capture_output {
+                // Capture output to display it
+                let output = cmd.output().await.map_err(|e| {
+                    EnvError::Execution(format!("Failed to execute command: {}", e))
+                })?;
 
-            // Display stdout
-            if !output.stdout.is_empty() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                print!("{}", stdout);
-            }
+                // Display stdout
+                if !output.stdout.is_empty() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    print!("{}", stdout);
+                }
 
-            // Display stderr
-            if !output.stderr.is_empty() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                eprint!("{}", stderr);
-            }
+                // Display stderr
+                if !output.stderr.is_empty() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprint!("{}", stderr);
+                }
 
-            output
-        } else {
-            // Don't capture, let it inherit (for real-time output)
-            let status = cmd.status().await.map_err(|e| {
-                EnvError::Execution(format!("Failed to execute command: {}", e))
-            })?;
+                output
+            } else {
+                // Don't capture, let it inherit (for real-time output)
+                let status = cmd.status().await.map_err(|e| {
+                    EnvError::Execution(format!("Failed to execute command: {}", e))
+                })?;
 
-            // Create a mock output for status checking
-            std::process::Output {
-                status,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            }
-        };
+                // Create a mock output for status checking
+                std::process::Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }
+            };
 
         if !output.status.success() {
             return Err(EnvError::Execution(format!(
@@ -1376,28 +1377,62 @@ impl MicromambaManager {
 
     /// Remove environment
     pub async fn remove_environment(&self, env_name: &str) -> Result<()> {
+        self.remove_environment_with_output(env_name, OutputMode::Stream)
+            .await
+    }
+
+    /// Remove environment with configurable output handling
+    pub async fn remove_environment_with_output(
+        &self,
+        env_name: &str,
+        output_mode: OutputMode,
+    ) -> Result<()> {
         let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("env")
             .arg("remove")
             .arg("-n")
             .arg(env_name)
-            .arg("-y")
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit());
+            .arg("-y");
 
-        // Apply environment variables
-        self.apply_env_to_command(&mut cmd);
+        let output = match output_mode {
+            OutputMode::Stream => {
+                cmd.stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit());
+                self.apply_env_to_command(&mut cmd);
+                let status = cmd.status().await.map_err(|e| {
+                    EnvError::Execution(format!("Failed to remove environment: {}", e))
+                })?;
+                std::process::Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }
+            }
+            OutputMode::Summary | OutputMode::Quiet => {
+                cmd.stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                self.apply_env_to_command(&mut cmd);
+                cmd.output().await.map_err(|e| {
+                    EnvError::Execution(format!("Failed to remove environment: {}", e))
+                })?
+            }
+        };
 
-        let status = cmd
-            .status()
-            .await
-            .map_err(|e| EnvError::Execution(format!("Failed to remove environment: {}", e)))?;
-
-        if !status.success() {
+        if !output.status.success() {
+            if !output.stdout.is_empty() {
+                print!("{}", String::from_utf8_lossy(&output.stdout));
+            }
+            if !output.stderr.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            }
             return Err(EnvError::Execution(format!(
                 "Failed to remove environment: exit code {:?}",
-                status.code()
+                output.status.code()
             )));
+        }
+
+        if matches!(output_mode, OutputMode::Summary) {
+            println!("✓ Removed environment {}", env_name);
         }
 
         info!("Environment {} removed successfully", env_name);
@@ -1517,7 +1552,10 @@ impl MicromambaManager {
             )));
         }
 
-        info!("Installing packages in environment '{}': {:?}", env_name, packages);
+        info!(
+            "Installing packages in environment '{}': {:?}",
+            env_name, packages
+        );
         debug!("micromamba path: {:?}", self.pm_path);
 
         // Build micromamba install command with default channels
@@ -1555,7 +1593,10 @@ impl MicromambaManager {
             )));
         }
 
-        info!("Successfully installed packages in environment '{}'", env_name);
+        info!(
+            "Successfully installed packages in environment '{}'",
+            env_name
+        );
         Ok(())
     }
 
@@ -1566,19 +1607,15 @@ impl MicromambaManager {
         for env_name in environment_names {
             if self.environment_exists(&env_name).await? {
                 if let Some(environment) = self.environments.get_mut(&env_name) {
-                    if environment.status != crate::micromamba::EnvironmentStatus::Ready
-                    {
-                        environment.status =
-                            crate::micromamba::EnvironmentStatus::Ready;
+                    if environment.status != crate::micromamba::EnvironmentStatus::Ready {
+                        environment.status = crate::micromamba::EnvironmentStatus::Ready;
                         info!("Environment '{}' is ready", env_name);
                     }
                 }
             } else {
                 if let Some(environment) = self.environments.get_mut(&env_name) {
-                    if environment.status == crate::micromamba::EnvironmentStatus::Ready
-                    {
-                        environment.status =
-                            crate::micromamba::EnvironmentStatus::NotInstalled;
+                    if environment.status == crate::micromamba::EnvironmentStatus::Ready {
+                        environment.status = crate::micromamba::EnvironmentStatus::NotInstalled;
                         warn!("Environment '{}' is not installed", env_name);
                     }
                 }
@@ -1608,27 +1645,25 @@ channels:
   - conda-forge
   - bioconda
 dependencies:
-  - python=3.10.13
+  - python=3.8.18
   - numpy=1.24.4
   - pandas
   - fastqc
-  - multiqc
+  - multiqc=1.19
   - seqkit
   - seqtk
   - qualimap
   - bismark
   - trim-galore
-  - samtools>=1.7
+  - samtools=1.15.1
+  - hdf5
   - star
-  - htseq
-  - rmats
+  - htseq=2.0.3
+  - rmats=4.1.2
   - picard
-  - macs2
+  - macs2=2.2.7.1
   - bwa=0.7.17
   - bowtie2=2.5.4
-  - phantompeakqualtools=1.2.1
-  - matplotlib
-  - seaborn
   - pyyaml
 "#
         .to_string()

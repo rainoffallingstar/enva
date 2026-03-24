@@ -1,6 +1,6 @@
 //! Environment management commands
 
-use crate::error::{Result, EnvError};
+use crate::error::{EnvError, Result};
 use crate::micromamba::MicromambaManager;
 use clap::{Args, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -169,9 +169,7 @@ async fn execute_env_create(
 
     let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
         error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution(
-            "Micromamba not found and auto-install failed.".to_string(),
-        )
+        EnvError::Execution("Micromamba not found and auto-install failed.".to_string())
     })?;
 
     // Determine which environments to create
@@ -278,8 +276,18 @@ async fn execute_env_create(
                 // Text output for dry-run
                 println!("[DRY-RUN] Environment: {}", env_name);
                 println!("[DRY-RUN] YAML file: {}", file_path_str);
-                println!("[DRY-RUN] File exists: {}", if file_exists { "YES" } else { "NO" });
-                println!("[DRY-RUN] Status: {}", if file_exists { "Ready to create" } else { "File not found!" });
+                println!(
+                    "[DRY-RUN] File exists: {}",
+                    if file_exists { "YES" } else { "NO" }
+                );
+                println!(
+                    "[DRY-RUN] Status: {}",
+                    if file_exists {
+                        "Ready to create"
+                    } else {
+                        "File not found!"
+                    }
+                );
                 println!("{}", "-".repeat(50));
             }
         }
@@ -310,10 +318,7 @@ async fn execute_env_create(
             // Use default path: try multiple locations
             let current_dir = std::env::current_dir().map_err(|e| {
                 error!("Failed to get current directory: {}", e);
-                EnvError::FileOperation(format!(
-                    "Failed to get current directory: {}",
-                    e
-                ))
+                EnvError::FileOperation(format!("Failed to get current directory: {}", e))
             })?;
 
             // Try src/configs/ first (development)
@@ -392,30 +397,21 @@ async fn execute_env_validate(
 
     let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
         error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution(
-            "Micromamba not found and auto-install failed.".to_string(),
-        )
+        EnvError::Execution("Micromamba not found and auto-install failed.".to_string())
     })?;
 
     let manager = micromamba_manager.lock().await;
 
     if args.all || args.name.is_none() {
         // Validate all environments by checking if they exist
-        let env_names = vec![
-            "xdxtools-core",
-            "xdxtools-snakemake",
-            "xdxtools-extra",
-        ];
+        let env_names = vec!["xdxtools-core", "xdxtools-snakemake", "xdxtools-extra"];
 
         if json {
             use serde_json::{json, Value};
             let mut results = Vec::new();
 
             for env_name in env_names {
-                let exists = manager
-                    .environment_exists(env_name)
-                    .await
-                    .unwrap_or(false);
+                let exists = manager.environment_exists(env_name).await.unwrap_or(false);
                 results.push(json!({
                     "environment": env_name,
                     "exists": exists,
@@ -487,9 +483,7 @@ async fn execute_env_install(args: EnvInstallArgs, verbose: bool) -> Result<()> 
 
     let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
         error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution(
-            "Micromamba not found and auto-install failed.".to_string(),
-        )
+        EnvError::Execution("Micromamba not found and auto-install failed.".to_string())
     })?;
 
     let manager = micromamba_manager.lock().await;
@@ -498,7 +492,11 @@ async fn execute_env_install(args: EnvInstallArgs, verbose: bool) -> Result<()> 
     // Flatten and parse package list (support comma-separated)
     let mut packages_to_install = Vec::new();
     for pkg_list in &args.packages {
-        for pkg in pkg_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        for pkg in pkg_list
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             packages_to_install.push(pkg.to_string());
         }
     }
@@ -514,7 +512,10 @@ async fn execute_env_install(args: EnvInstallArgs, verbose: bool) -> Result<()> 
         info!("Packages to install: {:?}", packages_to_install);
     }
 
-    match manager.install_packages(env_name, &packages_to_install).await {
+    match manager
+        .install_packages(env_name, &packages_to_install)
+        .await
+    {
         Ok(_) => {
             info!("Successfully installed packages in {}", env_name);
             Ok(())
@@ -532,14 +533,22 @@ async fn execute_env_remove(name: String, verbose: bool) -> Result<()> {
 
     let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
         error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution(
-            "Micromamba not found and auto-install failed.".to_string(),
-        )
+        EnvError::Execution("Micromamba not found and auto-install failed.".to_string())
     })?;
 
     let manager = micromamba_manager.lock().await;
 
-    match manager.remove_environment(&name).await {
+    match manager
+        .remove_environment_with_output(
+            &name,
+            if verbose {
+                OutputMode::Stream
+            } else {
+                OutputMode::Summary
+            },
+        )
+        .await
+    {
         Ok(_) => {
             info!("Successfully removed environment: {}", name);
             Ok(())
@@ -561,9 +570,7 @@ async fn list_all_conda_environments(json: bool) -> Result<()> {
     // Get the global manager
     let micromamba_manager = MicromambaManager::get_global_manager().await.map_err(|e| {
         error!("Failed to initialize MicromambaManager: {}", e);
-        EnvError::Execution(
-            "Micromamba not found and auto-install failed.".to_string(),
-        )
+        EnvError::Execution("Micromamba not found and auto-install failed.".to_string())
     })?;
 
     let manager = micromamba_manager.lock().await;
@@ -604,7 +611,11 @@ async fn list_all_conda_environments(json: bool) -> Result<()> {
 
         for env in &environments {
             let active_mark = if env.is_active { "*" } else { "" };
-            println!("{:<30} | {}", format!("{}{}", env.name, active_mark), env.prefix);
+            println!(
+                "{:<30} | {}",
+                format!("{}{}", env.name, active_mark),
+                env.prefix
+            );
         }
         println!();
     }
