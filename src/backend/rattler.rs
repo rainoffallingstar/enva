@@ -337,6 +337,22 @@ impl RattlerBackend {
         }
     }
 
+    async fn remove_conflicting_environment(
+        &self,
+        environment: &DiscoveredEnvironment,
+        output_mode: OutputMode,
+    ) -> Result<()> {
+        if environment.rattler_managed() {
+            let manager = self.helper_manager_for_environment(environment).await?;
+            return manager
+                .remove_environment_by_prefix_with_output(&environment.prefix, output_mode)
+                .await;
+        }
+
+        self.remove_foreign_environment(environment, output_mode)
+            .await
+    }
+
     fn source_priority(source: &EnvironmentSource) -> u8 {
         match source {
             EnvironmentSource::Rattler => 0,
@@ -432,6 +448,14 @@ impl RattlerBackend {
                 }
                 _ => None,
             })
+    }
+
+    fn removable_conflict_manager_label(environment: &DiscoveredEnvironment) -> Option<String> {
+        Self::helper_package_manager(environment).map(|package_manager| package_manager.to_string())
+    }
+
+    fn has_native_rattler_conflict(environment: &DiscoveredEnvironment) -> bool {
+        environment.rattler_managed() && Self::helper_package_manager(environment).is_none()
     }
 
     async fn helper_manager_for_environment(
@@ -829,15 +853,15 @@ impl EnvironmentBackend for RattlerBackend {
                 .filter(|environment| environment.prefix != target_prefix)
                 .collect::<Vec<DiscoveredEnvironment>>();
 
-        let owned_conflicts = conflicting_environments
+        let native_owned_conflicts = conflicting_environments
             .iter()
-            .filter(|environment| environment.rattler_managed())
+            .filter(|environment| Self::has_native_rattler_conflict(environment))
             .collect::<Vec<&DiscoveredEnvironment>>();
-        if !owned_conflicts.is_empty() {
+        if !native_owned_conflicts.is_empty() {
             return Err(EnvError::Execution(format!(
-                "Environment '{}' already exists in other rattler-owned prefixes: {}. Use --prefix to disambiguate.",
+                "Environment '{}' already exists in other native rattler-owned prefixes: {}. Use --prefix to disambiguate.",
                 env_name,
-                owned_conflicts
+                native_owned_conflicts
                     .iter()
                     .map(|environment| environment.prefix.display().to_string())
                     .collect::<Vec<String>>()
@@ -848,7 +872,7 @@ impl EnvironmentBackend for RattlerBackend {
         if !conflicting_environments.is_empty() {
             if !force {
                 return Err(EnvError::Execution(format!(
-                    "Environment '{}' already exists in other tool-managed prefixes: {}. Re-run with --force to remove them via their original package manager before recreating with rattler.",
+                    "Environment '{}' already exists in other tool-managed or adopted prefixes: {}. Re-run with --force to remove them via their original package manager before recreating with rattler.",
                     env_name,
                     conflicting_environments
                         .iter()
@@ -862,17 +886,13 @@ impl EnvironmentBackend for RattlerBackend {
                 if matches!(output_mode, OutputMode::Summary | OutputMode::Stream) {
                     println!(
                         "Removing conflicting {} environment '{}' at {} before rattler create...",
-                        match environment.source {
-                            EnvironmentSource::PackageManager(package_manager) => {
-                                package_manager.to_string()
-                            }
-                            EnvironmentSource::Rattler => "rattler".to_string(),
-                        },
+                        Self::removable_conflict_manager_label(environment)
+                            .unwrap_or_else(|| "rattler".to_string()),
                         env_name,
                         environment.prefix.display()
                     );
                 }
-                self.remove_foreign_environment(environment, output_mode)
+                self.remove_conflicting_environment(environment, output_mode)
                     .await?;
             }
         }
@@ -1131,13 +1151,23 @@ mod tests {
         prefix: &str,
         source: EnvironmentSource,
     ) -> DiscoveredEnvironment {
+        discovered_environment_with_owner(name, prefix, source, EnvironmentOwner::External, None)
+    }
+
+    fn discovered_environment_with_owner(
+        name: &str,
+        prefix: &str,
+        source: EnvironmentSource,
+        owner: EnvironmentOwner,
+        adopted_from: Option<EnvironmentSource>,
+    ) -> DiscoveredEnvironment {
         DiscoveredEnvironment {
             name: name.to_string(),
             prefix: PathBuf::from(prefix),
             is_active: false,
             source,
-            owner: EnvironmentOwner::External,
-            adopted_from: None,
+            owner,
+            adopted_from,
         }
     }
     #[cfg(unix)]
@@ -1276,6 +1306,43 @@ mod tests {
             .unwrap();
 
         assert!(!env_prefix.exists());
+    }
+
+    #[test]
+    fn helper_package_manager_uses_adopted_source_for_rattler_owned_environment() {
+        let environment = discovered_environment_with_owner(
+            "demo",
+            "/tmp/demo",
+            EnvironmentSource::Rattler,
+            EnvironmentOwner::Rattler,
+            Some(EnvironmentSource::PackageManager(
+                PackageManager::Micromamba,
+            )),
+        );
+
+        assert_eq!(
+            RattlerBackend::helper_package_manager(&environment),
+            Some(PackageManager::Micromamba)
+        );
+        assert_eq!(
+            RattlerBackend::removable_conflict_manager_label(&environment),
+            Some("micromamba".to_string())
+        );
+        assert!(!RattlerBackend::has_native_rattler_conflict(&environment));
+    }
+
+    #[test]
+    fn has_native_rattler_conflict_rejects_unadopted_rattler_environment() {
+        let environment = discovered_environment_with_owner(
+            "demo",
+            "/tmp/demo",
+            EnvironmentSource::Rattler,
+            EnvironmentOwner::Rattler,
+            None,
+        );
+
+        assert_eq!(RattlerBackend::helper_package_manager(&environment), None);
+        assert!(RattlerBackend::has_native_rattler_conflict(&environment));
     }
 
     #[test]
