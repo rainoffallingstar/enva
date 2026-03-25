@@ -1,9 +1,8 @@
-//! Package manager detection and abstraction
+//! Compatibility package-manager detection for enva.
 //!
-//! Auto-detects and prioritizes: micromamba → mamba → conda
-//! - micromamba: 3-5x faster, lightweight
-//! - mamba: 2-3x faster than conda
-//! - conda: Most compatible, slowest
+//! enva is rattler-first. This module only discovers secondary package managers
+//! (`micromamba`, `mamba`, `conda`) for compatibility scenarios such as
+//! environment discovery, adoption, and explicit fallback flows.
 
 use crate::error::Result;
 use clap::ValueEnum;
@@ -71,14 +70,14 @@ fn availability_cache() -> &'static Mutex<HashMap<PackageManager, bool>> {
     AVAILABILITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Detector with priority-based auto-detection
+/// Detector for compatibility package managers
 pub struct PackageManagerDetector {
     detected: Option<PackageManager>,
     detection_order: Vec<PackageManager>,
 }
 
 impl PackageManagerDetector {
-    /// Default: micromamba → mamba → conda (prioritize fastest)
+    /// Default compatibility preference: micromamba → mamba → conda
     pub fn new() -> Self {
         Self {
             detected: None,
@@ -132,7 +131,7 @@ impl PackageManagerDetector {
             .collect()
     }
 
-    /// List available package managers while honoring ENVA_PACKAGE_MANAGER as a first-choice hint
+    /// List available compatibility package managers while honoring ENVA_PACKAGE_MANAGER as a first-choice hint
     pub fn available_managers_with_env_override(&self) -> Vec<PackageManager> {
         self.available_managers_with_preference(Self::preferred_manager_from_env())
     }

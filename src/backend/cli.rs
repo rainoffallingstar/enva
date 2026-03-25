@@ -86,7 +86,8 @@ impl EnvironmentBackend for CliBackend {
         _output_mode: OutputMode,
     ) -> Result<()> {
         Err(EnvError::Execution(
-            "adopt is only supported by the rattler backend".to_string(),
+            "adopt requires the default rattler backend; compatibility mode does not support it"
+                .to_string(),
         ))
     }
 

@@ -1,16 +1,8 @@
-//! Micromamba environment management for enva
+//! Compatibility package-manager support for enva.
 //!
-//! Provides simplified micromamba environment management for the 3 core environments:
-//! - xdxtools-core: All bioinformatics tools (includes qualimap)
-//! - xdxtools-snakemake: Workflow engine
-//! - xdxtools-extra: Additional visualization and analysis tools
-//!
-//! Key features:
-//! - Automatic micromamba installation if not found
-//! - Dry-run validation for YAML files
-//! - JSON output for automation
-//! - Cross-platform support (Linux/macOS)
-//! - Performance: 2-3x faster than conda
+//! enva is rattler-first. This module retains the historical `MicromambaManager`
+//! type as a compatibility layer for `micromamba` / `mamba` / `conda` discovery,
+//! adoption, and explicit fallback flows.
 
 use crate::backend::OutputMode;
 use crate::error::{EnvError, Result};

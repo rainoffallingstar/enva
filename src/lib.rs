@@ -1,4 +1,4 @@
-//! enva - A lightweight micromamba environment manager for bioinformatics workflows
+//! enva - A rattler-first environment manager for bioinformatics workflows
 
 pub mod backend;
 pub mod env;
@@ -20,16 +20,12 @@ pub const CORE_ENV_NAME: &str = "xdxtools-core";
 pub const SNAKEMAKE_ENV_NAME: &str = "xdxtools-snakemake";
 pub const EXTRA_ENV_NAME: &str = "xdxtools-extra";
 
-/// Initialize enva library
-/// This function can be used to perform any one-time initialization
+/// Initialize enva library.
+///
+/// This only performs process-local setup and does not require any compatibility
+/// package manager to be available.
 pub async fn initialize() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
-
-    // Verify micromamba is available
-    let manager = micromamba::MicromambaManager::get_global_manager().await?;
-    let _manager = manager.lock().await;
-
+    let _ = tracing_subscriber::fmt::try_init();
     Ok(())
 }
 
@@ -38,9 +34,20 @@ pub fn display_startup_banner() {
     println!(
         r#"#========================================#
 #       enva v0.1.0                        #
-#  Micromamba Environment Manager          #
+#  Rattler-First Env Manager               #
 #  For Bioinformatics Workflows            #
 #========================================#
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initialize;
+
+    #[tokio::test]
+    async fn initialize_is_idempotent_without_package_manager_probe() {
+        initialize().await.unwrap();
+        initialize().await.unwrap();
+    }
 }

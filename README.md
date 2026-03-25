@@ -1,39 +1,29 @@
-# enva - Lightweight Micromamba Environment Manager
+# enva - Rattler-First Environment Manager
 
-A lightweight, standalone micromamba environment manager for bioinformatics workflows, extracted from xdxtools-rs.
+enva is a standalone, rattler-first environment manager for bioinformatics workflows. It creates and maintains its own environments natively, while still discovering and interoperating with existing `conda`, `mamba`, and `micromamba` environments when needed.
 
-## 🚀 Features
+## Features
 
-- **Automatic Micromamba Installation**: Downloads and installs micromamba if not found
-- **Multi-Platform Support**: Linux, macOS, Windows
-- **3 Pre-configured Environments**:
-  - `xdxtools-core`: Core bioinformatics tools (FastQC, MultiQC, Bismark, Qualimap, etc.)
-  - `xdxtools-snakemake`: Workflow engine and dependencies
-  - `xdxtools-extra`: Advanced visualization and analysis tools
+- **Rattler-first by default**: native create, solve, install, run, and remove flows for rattler-managed environments
+- **Compatibility aware**: discovers environments from `conda`, `mamba`, and `micromamba`, then merges same-name entries by priority
+- **Adoption support**: can adopt an existing external environment into rattler ownership metadata
+- **Three pre-configured environments**:
+  - `xdxtools-core`
+  - `xdxtools-snakemake`
+  - `xdxtools-extra`
+- **Operational controls**: dry-run validation, JSON output, detailed environment listing, cache cleanup
 
-- **Complete Environment Management**:
-  - Create environments from YAML configs
-  - List and validate environments
-  - Install packages into environments
-  - Run commands/scripts in environments
-  - Remove environments
+## Installation
 
-- **Performance Optimizations**:
-  - 2-3x faster than conda
-  - 30% smaller disk footprint
-  - Binary size: 5.4MB (release) vs 50MB (xdxtools)
+### Download a release binary
 
-## 📦 Installation
+Download the latest release asset for your platform:
+- `enva-windows-x86_64.exe`
+- `enva-linux-x86_64`
+- `enva-macos-x86_64`
+- `enva-macos-aarch64`
 
-### Option 1: Download Pre-built Binary
-
-Download the latest release from the `release-YYYYMMDD-HHMMSS/` directory:
-- `enva-windows-x86_64.exe` (Windows)
-- `enva-linux-x86_64` (Linux)
-- `enva-macos-x86_64` (macOS Intel)
-- `enva-macos-aarch64` (macOS Apple Silicon)
-
-### Option 2: Build from Source
+### Build from source
 
 ```bash
 git clone <repository>
@@ -41,231 +31,114 @@ cd enva
 cargo build --release
 ```
 
-## 🎯 Usage
+## Usage
 
-### Create Environments
+### Create environments
 
 ```bash
-# Create all environments
+# Create all built-in environments
 ./enva create --all
 
-# Create specific environment
+# Create selected built-in environments
 ./enva create --core
-./enva create --r
 ./enva create --snakemake
 ./enva create --extra
 
-# Create with custom name
-./enva create --name my-env
+# Create a custom environment from YAML
+./enva create --yaml ./src/configs/xdxtools-core.yaml --name xdxtools-core
 
-# Replace an existing environment and clean caches first
-./enva create --yaml ./environments/configs/xdxtools-core.yaml --name xdxtools-core --force --clean-cache
+# Replace an existing environment and clean rattler caches first
+./enva create --yaml ./src/configs/xdxtools-core.yaml --name xdxtools-core --force --clean-cache
 
-# Output control
-./enva create --core --output summary   # concise spinner + final status
-./enva create --core --output stream    # real-time micromamba logs and progress
-./enva create --core --output quiet     # suppress normal create output
-
-# Dry-run validation
+# Validate only
 ./enva --dry-run create --all
 ```
 
-### List Environments
+### List environments
 
 ```bash
-# List all environments
+# Merge same-name environments and show prefixes
 ./enva list
 
-# Detailed view
+# Show owner / source / adopted-from columns
 ./enva list --detailed
 
 # JSON output
 ./enva --json list
 ```
 
-### Run Commands
+### Run commands
 
 ```bash
-# Run command in environment
+# Recommended syntax
+./enva run xdxtools-core -- fastqc --version
+
+# Equivalent flag-based syntax
 ./enva run --name xdxtools-core --command "fastqc --version"
 
-# Run script with arguments
-./enva run --name xdxtools-core --script my_analysis.py -- arg1 arg2
-
-# Set environment variables
-./enva run --name xdxtools-core --command "echo $MY_VAR" --env MY_VAR=value
-
-# Specify working directory
-./enva run --name xdxtools-core --script process.sh --cwd /path/to/work
+# Explicit prefix
+./enva run --prefix /path/to/env -- fastqc --version
 ```
 
-### Install Packages
+### Install packages
 
 ```bash
-# Install packages in environment
-./enva install --name xdxtools-core --packages "fastqc,multiqc"
+# Install multiple packages
+./enva install --name xdxtools-core fastqc multiqc
 
-# Install in snakemake environment
-./enva install --name xdxtools-snakemake --packages "biopython,pyyaml"
+# Comma-separated input is also accepted
+./enva install --name xdxtools-core fastqc,multiqc
 ```
 
-### Validate Environments
+### Adopt or remove environments
 
 ```bash
-# Validate all environments
+# Adopt an existing environment by name or prefix
+./enva adopt --name xdxtools-core
+./enva adopt --prefix /path/to/external/env
+
+# Remove an environment
+./enva remove xdxtools-core
+```
+
+### Validate configuration
+
+```bash
 ./enva validate --all
-
-# Validate specific environment
 ./enva validate --name xdxtools-core
 ```
 
-### Remove Environments
+## Compatibility model
+
+- **Primary path**: rattler-managed environments
+- **Secondary path**: adopted or external environments discovered from `conda`, `mamba`, or `micromamba`
+- `ENVA_PACKAGE_MANAGER` is a compatibility hint for choosing which secondary package manager to inspect first
+- `ENVA_BACKEND=cli` is an expert-only compatibility mode; the normal default remains `rattler`
+
+Examples:
 
 ```bash
-# Remove environment
-./enva remove my-env
+# Prefer a specific compatibility package manager when listing/running in CLI mode
+ENVA_PACKAGE_MANAGER=conda ENVA_BACKEND=cli enva run xdxtools-core -- fastqc --version
+
+# Force explicit compatibility mode for troubleshooting
+ENVA_BACKEND=cli enva list --detailed
 ```
 
-## 🔧 Configuration
+## Limitations
 
-Environment configurations are defined in `src/configs/`:
-- `xdxtools-core.yaml`: Core bioinformatics tools
-- `xdxtools-snakemake.yaml`: Workflow engine
-- `xdxtools-extra.yaml`: Advanced tools
+- `pip:` subsections inside environment YAML files are intentionally rejected by the rattler backend
+- If multiple accessible environments share the same name, `enva` prioritizes rattler-owned prefixes and may ask you to disambiguate with `--prefix`
 
-## 📊 Performance
-
-| Metric | xdxtools | enva | Improvement |
-|--------|----------|------|-------------|
-| Binary Size | ~50MB | 5.4MB | **89% smaller** |
-| Startup Time | 2-3s | ~0.2s | **10-15x faster** |
-| Memory Usage | ~100MB | ~30MB | **70% less** |
-| Dependencies | ~50 | 9 | **82% reduction** |
-
-## 🎓 Migration from xdxtools
-
-This tool was extracted from `xdxtools-rs` with minimal changes:
-
-1. **Same micromamba logic**: 100% code reuse
-2. **Simplified CLI**: Removed xdxtools-specific options
-3. **Reduced dependencies**: Removed unused crates
-4. **Improved performance**: LTO, strip, optimized builds
-
-## 📝 Command Reference
-
-```
-enva [OPTIONS] <COMMAND>
-
-Commands:
-  create    Create conda environments
-  list      List conda environments
-  validate  Validate environment configuration
-  install   Install components in environment
-  remove    Remove conda environment
-  run       Run command or script in environment
-  help      Print this message or the help of the given subcommand(s)
-
-Options:
-  -v, --verbose    Enable verbose output
-  -q, --quiet      Quiet mode (suppress output)
-  -l, --log <LOG>  Log file path
-      --dry-run    Enable dry-run mode (validate without creating)
-      --json       Output in JSON format
-  -h, --help       Print help
-  -V, --version    Print version
-```
-
-## 🔍 Troubleshooting
-
-### Common Issues
-
-#### Environment creation fails
-- **Error**: "Failed to create environment"
-- **Solution**: Check micromamba installation, verify YAML config syntax
-- **Exit code**: 1
-
-#### Package not found
-- **Error**: "Package installation failed: package not found"
-- **Solution**: Verify package name, check channel availability
-- **Exit code**: 1
-
-#### Configuration file error
-- **Error**: "Failed to parse YAML configuration"
-- **Solution**: Validate YAML syntax, check file path
-- **Exit code**: 3
-
-### Exit Codes
-
-- `0`: Success
-- `1`: General error
-- `2`: Command line argument error
-- `3`: Configuration file error
-- `4`: Network/download error
-
-### Configuration Override
-
-You can override the default package manager by setting the `ENVA_PACKAGE_MANAGER` environment variable:
-
-```bash
-# Force use of conda
-ENVA_PACKAGE_MANAGER=conda enva create --core
-
-# Force use of mamba
-ENVA_PACKAGE_MANAGER=mamba enva create --core
-
-# Force use of micromamba
-ENVA_PACKAGE_MANAGER=micromamba enva create --core
-```
-
-## 📈 Benchmarking
-
-Use the in-process benchmark binary to compare cold and hot `enva run` performance:
+## Benchmarking
 
 ```bash
 # Build the benchmark helper
 cargo build --bin enva-bench
 
-# Benchmark automatic manager selection
+# Benchmark the default rattler-first run path
 cargo run --bin enva-bench -- --env-name xdxtools-core --command "true"
 
-# Benchmark a specific package manager with more hot iterations
-cargo run --bin enva-bench -- --env-name xdxtools-core --pm micromamba --iterations 10
-
-# Compare enva against native micromamba output in JSON
+# Compare with an explicit compatibility package manager
 cargo run --bin enva-bench -- --env-name xdxtools-core --pm micromamba --compare-native --format json
-
-# Export CSV for regression tracking
-cargo run --bin enva-bench -- --env-name xdxtools-core --pm micromamba --format csv
 ```
-
-Supported formats:
-- `text`: human-readable summary
-- `json`: machine-readable array of benchmark rows
-- `csv`: one row per benchmark result, suitable for spreadsheets or CI artifacts
-
-The first run reflects a cold path. Subsequent runs in the same process show the effect of the runtime manager and environment-list caches.
-
-## 🛠️ Development
-
-```bash
-# Build dev version
-cargo build
-
-# Run tests
-cargo test
-
-# Build release version
-cargo build --release
-
-# Check for warnings
-cargo clippy
-```
-
-## 📜 License
-
-MIT License - see LICENSE file for details.
-
-## 🙏 Credits
-
-- Built on [micromamba](https://github.com/mamba-org/micromamba) by mamba-org
-- Extracted from [xdxtools-rs](https://github.com/Genomiclab/xdxtools)

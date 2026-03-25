@@ -3,7 +3,7 @@ name = "enva"
 version = "0.1.0"
 edition = "2021"
 authors = ["Yanhua Zheng <zyh3084989256@gmail.com>"]
-description = "A lightweight micromamba environment manager for bioinformatics workflows"
+description = "A rattler-first environment manager for bioinformatics workflows"
 license = "MIT"
 repository = "https://github.com/Genomiclab/enva"
 

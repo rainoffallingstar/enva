@@ -1426,6 +1426,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_yaml_accepts_basic_environment_file() {
+        let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
         let yaml_file = tempdir.path().join("env.yaml");
         fs::write(
@@ -1445,6 +1446,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_yaml_reports_missing_dependencies_section() {
+        let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
         let yaml_file = tempdir.path().join("env.yaml");
         fs::write(&yaml_file, "name: test-env\nchannels:\n  - conda-forge\n").unwrap();
@@ -1462,6 +1464,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_yaml_reports_pip_subsection_as_unsupported() {
+        let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
         let yaml_file = tempdir.path().join("env.yaml");
         fs::write(
@@ -1500,6 +1503,7 @@ mod tests {
 
     #[test]
     fn preferred_root_prefix_uses_first_existing_root() {
+        let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
         let preferred = tempdir.path().join("preferred-root");
         let fallback = tempdir.path().join("fallback-root");
@@ -1517,6 +1521,7 @@ mod tests {
 
     #[test]
     fn target_prefix_uses_envs_subdirectory() {
+        let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
         let root = tempdir.path().join("rattler-root");
         let backend = backend_with_root(&root);
@@ -1527,6 +1532,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_environment_prefixes_returns_named_environment() {
+        let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
         let root = tempdir.path().join("rattler-root");
         let env_prefix = root.join("envs").join("test-env");
@@ -1540,6 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_environment_with_output_removes_named_environment() {
+        let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
         let root = tempdir.path().join("rattler-root");
         let env_prefix = root.join("envs").join("test-env");
@@ -1775,6 +1782,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_uses_prefix_bin_and_conda_prefix() {
+        let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
         let root = tempdir.path().join("rattler-root");
         let env_prefix = root.join("envs").join("test-env");

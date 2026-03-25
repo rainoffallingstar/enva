@@ -20,7 +20,7 @@ pub struct EnvRunArgs {
     #[arg(short, long, value_name = "ENV")]
     pub name: Option<String>,
 
-    /// Explicit package manager to use for environment lookup and execution
+    /// Explicit compatibility package manager for CLI fallback mode
     #[arg(long, value_enum)]
     pub pm: Option<PackageManager>,
 
@@ -163,7 +163,7 @@ fn validate_backend_request(
 ) -> Result<()> {
     if selector.kind == BackendKind::Rattler && requested_pm.is_some() {
         return Err(EnvError::Validation(
-            "--pm can only be used with the CLI backend".to_string(),
+            "--pm is only available in compatibility mode (ENVA_BACKEND=cli)".to_string(),
         ));
     }
 
@@ -659,6 +659,9 @@ mod tests {
             },
             Some(PackageManager::Micromamba),
         );
-        assert!(result.is_err());
+        let error = result.expect_err("rattler backend should reject --pm");
+        assert!(error
+            .to_string()
+            .contains("compatibility mode (ENVA_BACKEND=cli)"));
     }
 }

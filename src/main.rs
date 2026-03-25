@@ -1,4 +1,4 @@
-//! enva - A lightweight micromamba environment manager for bioinformatics workflows
+//! enva - A rattler-first environment manager for bioinformatics workflows
 
 use clap::Parser;
 use enva::env::{execute_env_command, EnvCommand};
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 /// CLI arguments for enva
 #[derive(Debug, Parser)]
 #[command(name = "enva")]
-#[command(about = "A lightweight micromamba environment manager for bioinformatics workflows")]
+#[command(about = "A rattler-first environment manager for bioinformatics workflows")]
 #[command(version)]
 struct Cli {
     /// Enable verbose output
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize logging
     if cli.verbose {
-        tracing_subscriber::fmt::init();
+        let _ = tracing_subscriber::fmt::try_init();
     }
 
     // Execute the command
