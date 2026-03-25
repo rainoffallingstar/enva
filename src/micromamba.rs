@@ -6,6 +6,7 @@
 
 use crate::backend::OutputMode;
 use crate::error::{EnvError, Result};
+use crate::ownership::ownership_record_path;
 use crate::package_manager::{PackageManager, PackageManagerDetector};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest;
@@ -439,6 +440,50 @@ impl MicromambaManager {
         env_vars.insert("MAMBARC".to_string(), Self::null_device_path().to_string());
 
         env_vars
+    }
+
+    fn stash_ownership_marker(prefix: &Path) -> Result<Option<String>> {
+        let marker_path = ownership_record_path(prefix);
+        if !marker_path.is_file() {
+            return Ok(None);
+        }
+
+        let contents = fs::read_to_string(&marker_path).map_err(|error| {
+            EnvError::FileOperation(format!(
+                "Failed to read ownership marker {}: {}",
+                marker_path.display(),
+                error
+            ))
+        })?;
+
+        fs::remove_file(&marker_path).map_err(|error| {
+            EnvError::FileOperation(format!(
+                "Failed to temporarily remove ownership marker {}: {}",
+                marker_path.display(),
+                error
+            ))
+        })?;
+
+        Ok(Some(contents))
+    }
+
+    fn restore_ownership_marker(prefix: &Path, contents: Option<String>) -> Result<()> {
+        let Some(contents) = contents else {
+            return Ok(());
+        };
+
+        if !prefix.exists() {
+            return Ok(());
+        }
+
+        let marker_path = ownership_record_path(prefix);
+        fs::write(&marker_path, contents).map_err(|error| {
+            EnvError::FileOperation(format!(
+                "Failed to restore ownership marker {}: {}",
+                marker_path.display(),
+                error
+            ))
+        })
     }
 
     /// Get MAMBA_ROOT_PREFIX path
@@ -1466,19 +1511,27 @@ impl MicromambaManager {
             .arg(target)
             .arg("-y");
 
-        let output = match output_mode {
+        let stashed_ownership_marker = if target_flag == "-p" {
+            Self::stash_ownership_marker(Path::new(target))?
+        } else {
+            None
+        };
+
+        let output_result = match output_mode {
             OutputMode::Stream => {
                 cmd.stdout(std::process::Stdio::inherit())
                     .stderr(std::process::Stdio::inherit());
                 self.apply_env_to_command(&mut cmd);
-                let status = cmd.status().await.map_err(|e| {
-                    EnvError::Execution(format!("Failed to remove environment: {}", e))
-                })?;
-                std::process::Output {
-                    status,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                }
+                cmd.status()
+                    .await
+                    .map(|status| std::process::Output {
+                        status,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    })
+                    .map_err(|e| {
+                        EnvError::Execution(format!("Failed to remove environment: {}", e))
+                    })
             }
             OutputMode::Summary | OutputMode::Quiet => {
                 cmd.stdout(std::process::Stdio::piped())
@@ -1486,7 +1539,32 @@ impl MicromambaManager {
                 self.apply_env_to_command(&mut cmd);
                 cmd.output().await.map_err(|e| {
                     EnvError::Execution(format!("Failed to remove environment: {}", e))
-                })?
+                })
+            }
+        };
+        let restore_result = if target_flag == "-p" {
+            Self::restore_ownership_marker(Path::new(target), stashed_ownership_marker)
+        } else {
+            Ok(())
+        };
+
+        let output = match (output_result, restore_result) {
+            (Ok(output), Ok(())) => output,
+            (Err(error), Ok(())) => return Err(error),
+            (Ok(output), Err(error)) if output.status.success() => return Err(error),
+            (Ok(output), Err(error)) => {
+                return Err(EnvError::Execution(format!(
+                    "Failed to remove environment: exit code {:?}; additionally failed to restore enva ownership marker in {}: {}",
+                    output.status.code(),
+                    target,
+                    error
+                )));
+            }
+            (Err(remove_error), Err(restore_error)) => {
+                return Err(EnvError::Execution(format!(
+                    "{}; additionally failed to restore enva ownership marker in {}: {}",
+                    remove_error, target, restore_error
+                )));
             }
         };
 
@@ -1701,24 +1779,42 @@ impl MicromambaManager {
 
         self.apply_env_to_command(&mut cmd);
 
-        let status = cmd.status().await.map_err(|e| {
+        let stashed_ownership_marker = Self::stash_ownership_marker(prefix)?;
+        let install_result = cmd.status().await.map_err(|e| {
             EnvError::Execution(format!("Failed to execute {} install: {}", self.pm_type, e))
-        })?;
+        });
+        let restore_result = Self::restore_ownership_marker(prefix, stashed_ownership_marker);
 
-        if !status.success() {
-            return Err(EnvError::Execution(format!(
+        match (install_result, restore_result) {
+            (Ok(status), Ok(())) if status.success() => {
+                info!(
+                    "Successfully installed packages in environment prefix '{}'",
+                    prefix.display()
+                );
+                Ok(())
+            }
+            (Ok(status), Ok(())) => Err(EnvError::Execution(format!(
                 "Failed to install packages into {} using {}: exit code {:?}",
                 prefix.display(),
                 self.pm_type,
                 status.code()
-            )));
+            ))),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(status), Err(error)) if status.success() => Err(error),
+            (Ok(status), Err(error)) => Err(EnvError::Execution(format!(
+                "Failed to install packages into {} using {}: exit code {:?}; additionally failed to restore enva ownership marker: {}",
+                prefix.display(),
+                self.pm_type,
+                status.code(),
+                error
+            ))),
+            (Err(install_error), Err(restore_error)) => Err(EnvError::Execution(format!(
+                "{}; additionally failed to restore enva ownership marker in {}: {}",
+                install_error,
+                prefix.display(),
+                restore_error
+            ))),
         }
-
-        info!(
-            "Successfully installed packages in environment prefix '{}'",
-            prefix.display()
-        );
-        Ok(())
     }
 
     /// Update environment statuses (for compatibility with CondaManager API)
@@ -1920,6 +2016,15 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::Mutex;
 
+    fn create_fake_environment(prefix: &Path) {
+        fs::create_dir_all(prefix.join("conda-meta")).unwrap();
+        fs::write(
+            prefix.join("conda-meta").join("history"),
+            "created by test\n",
+        )
+        .unwrap();
+    }
+
     fn build_test_manager(config_dir: &Path) -> MicromambaManager {
         MicromambaManager {
             pm_path: PathBuf::from("micromamba"),
@@ -1967,5 +2072,43 @@ dependencies:
         assert!(envs.iter().any(|env| env.name == "xdxtools-core"));
         assert!(envs.iter().any(|env| env.name == "xdxtools-snakemake"));
         assert!(envs.iter().any(|env| env.name == "xdxtools-extra"));
+    }
+
+    #[test]
+    fn ownership_marker_can_be_stashed_and_restored() {
+        let temp_dir = tempdir().unwrap();
+        let prefix = temp_dir.path().join("envs").join("demo");
+        create_fake_environment(&prefix);
+        fs::write(
+            prefix.join("conda-meta").join("enva-rattler.json"),
+            r#"{"version":1,"owner":"rattler"}"#,
+        )
+        .unwrap();
+
+        let stashed = MicromambaManager::stash_ownership_marker(&prefix).unwrap();
+        assert_eq!(
+            stashed.as_deref(),
+            Some(r#"{"version":1,"owner":"rattler"}"#)
+        );
+        assert!(!prefix.join("conda-meta").join("enva-rattler.json").exists());
+
+        MicromambaManager::restore_ownership_marker(&prefix, stashed).unwrap();
+        assert_eq!(
+            fs::read_to_string(prefix.join("conda-meta").join("enva-rattler.json")).unwrap(),
+            r#"{"version":1,"owner":"rattler"}"#
+        );
+    }
+
+    #[test]
+    fn ownership_marker_restore_is_noop_when_absent() {
+        let temp_dir = tempdir().unwrap();
+        let prefix = temp_dir.path().join("envs").join("demo");
+        create_fake_environment(&prefix);
+
+        let stashed = MicromambaManager::stash_ownership_marker(&prefix).unwrap();
+        assert!(stashed.is_none());
+
+        MicromambaManager::restore_ownership_marker(&prefix, stashed).unwrap();
+        assert!(!prefix.join("conda-meta").join("enva-rattler.json").exists());
     }
 }

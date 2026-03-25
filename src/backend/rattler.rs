@@ -1,7 +1,9 @@
 use super::{BackendKind, EnvironmentBackend, EnvironmentTarget, OutputMode, RunRequest};
 use crate::error::{EnvError, Result};
 use crate::micromamba::{CondaEnvironment, MicromambaManager, ValidationDetails, ValidationResult};
-use crate::ownership::{read_ownership_record, write_rattler_ownership_record};
+use crate::ownership::{
+    ownership_record_path, read_ownership_record, write_rattler_ownership_record,
+};
 use crate::package_manager::{PackageManager, PackageManagerDetector};
 use crate::prefix_registry::{
     discover_cli_environments, merge_discovered_environments, DiscoveredEnvironment,
@@ -330,6 +332,92 @@ impl RattlerBackend {
         channels
     }
 
+    fn collect_installed_prefix_records(prefix: &Path) -> Result<Vec<PrefixRecord>> {
+        let conda_meta_path = prefix.join("conda-meta");
+
+        if !conda_meta_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let ownership_marker = ownership_record_path(prefix);
+        let mut json_paths: Vec<_> = fs::read_dir(&conda_meta_path)
+            .map_err(|error| {
+                EnvError::FileOperation(format!(
+                    "Failed to read {}: {}",
+                    conda_meta_path.display(),
+                    error
+                ))
+            })?
+            .filter_map(|entry| {
+                entry.ok().and_then(|entry| {
+                    let path = entry.path();
+                    let is_json = entry.file_type().ok()?.is_file()
+                        && path.extension().and_then(|ext| ext.to_str()) == Some("json");
+                    if is_json && path != ownership_marker {
+                        Some(path)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        json_paths.sort();
+
+        json_paths
+            .into_iter()
+            .map(|record_path| {
+                PrefixRecord::from_path(&record_path).map_err(|error| {
+                    EnvError::FileOperation(format!(
+                        "Failed to parse prefix record {}: {}",
+                        record_path.display(),
+                        error
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn stash_ownership_marker(prefix: &Path) -> Result<Option<String>> {
+        let marker_path = ownership_record_path(prefix);
+        if !marker_path.is_file() {
+            return Ok(None);
+        }
+
+        let contents = fs::read_to_string(&marker_path).map_err(|error| {
+            EnvError::FileOperation(format!(
+                "Failed to read ownership marker {}: {}",
+                marker_path.display(),
+                error
+            ))
+        })?;
+
+        fs::remove_file(&marker_path).map_err(|error| {
+            EnvError::FileOperation(format!(
+                "Failed to temporarily remove ownership marker {}: {}",
+                marker_path.display(),
+                error
+            ))
+        })?;
+
+        Ok(Some(contents))
+    }
+
+    fn restore_ownership_marker(prefix: &Path, contents: Option<String>) -> Result<()> {
+        let Some(contents) = contents else {
+            return Ok(());
+        };
+
+        let marker_path = ownership_record_path(prefix);
+        fs::write(&marker_path, contents).map_err(|error| {
+            EnvError::FileOperation(format!(
+                "Failed to restore ownership marker {}: {}",
+                marker_path.display(),
+                error
+            ))
+        })
+    }
+
     fn parse_match_specs(spec_strings: &[String]) -> Result<Vec<MatchSpec>> {
         spec_strings
             .iter()
@@ -431,11 +519,23 @@ impl RattlerBackend {
             .list_environment_prefixes()?
             .into_iter()
             .map(|prefix| {
-                let adopted_from = read_ownership_record(&prefix)
-                    .ok()
-                    .flatten()
-                    .and_then(|record| record.adopted_from)
-                    .and_then(|source| EnvironmentSource::from_label(&source));
+                let ownership_record = read_ownership_record(&prefix).ok().flatten();
+                let adopted_from = ownership_record
+                    .as_ref()
+                    .and_then(|record| record.adopted_from.as_deref())
+                    .and_then(EnvironmentSource::from_label);
+                let owner = ownership_record
+                    .as_ref()
+                    .filter(|record| record.is_rattler_owned())
+                    .map(|_| EnvironmentOwner::Rattler)
+                    .unwrap_or(EnvironmentOwner::External);
+                let source = match (&owner, &adopted_from) {
+                    (EnvironmentOwner::Rattler, Some(source)) => source.clone(),
+                    (EnvironmentOwner::Rattler, None) => EnvironmentSource::Rattler,
+                    (EnvironmentOwner::External, _) => {
+                        EnvironmentSource::PackageManager(PackageManager::None)
+                    }
+                };
 
                 DiscoveredEnvironment {
                     name: self.environment_name_for_prefix(&prefix),
@@ -444,8 +544,8 @@ impl RattlerBackend {
                         .map(|active| Path::new(active) == prefix)
                         .unwrap_or(false),
                     prefix,
-                    source: EnvironmentSource::Rattler,
-                    owner: EnvironmentOwner::Rattler,
+                    source,
+                    owner,
                     adopted_from,
                 }
             })
@@ -464,6 +564,12 @@ impl RattlerBackend {
         output_mode: OutputMode,
     ) -> Result<()> {
         match environment.source {
+            EnvironmentSource::PackageManager(PackageManager::None) => {
+                let manager = self.helper_manager_for_environment(environment).await?;
+                manager
+                    .remove_environment_by_prefix_with_output(&environment.prefix, output_mode)
+                    .await
+            }
             EnvironmentSource::PackageManager(package_manager) => {
                 let manager =
                     MicromambaManager::new_runtime_with_package_manager(package_manager).await?;
@@ -879,7 +985,7 @@ impl RattlerBackend {
             )));
         }
 
-        let installed = PrefixRecord::collect_from_prefix(prefix).map_err(|error| {
+        let installed = Self::collect_installed_prefix_records(prefix).map_err(|error| {
             EnvError::FileOperation(format!(
                 "Failed to read installed packages from {}: {}",
                 prefix.display(),
@@ -900,21 +1006,34 @@ impl RattlerBackend {
             .await?;
 
         let cache_root = Self::cache_root_dir()?;
-        Installer::new()
+        let stashed_ownership_marker = Self::stash_ownership_marker(prefix)?;
+        let install_result = Installer::new()
             .with_package_cache(PackageCache::new(Self::package_cache_dir(&cache_root)))
             .with_installed_packages(installed)
             .with_requested_specs(requested_specs)
             .install(prefix, solved_records)
             .await
+            .map(|_| ())
             .map_err(|error| {
                 EnvError::Execution(format!(
                     "Failed to install solved packages into {}: {}",
                     prefix.display(),
                     error
                 ))
-            })?;
+            });
+        let restore_result = Self::restore_ownership_marker(prefix, stashed_ownership_marker);
 
-        Ok(())
+        match (install_result, restore_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(install_error), Err(restore_error)) => Err(EnvError::Execution(format!(
+                "{}; additionally failed to restore enva ownership marker in {}: {}",
+                install_error,
+                prefix.display(),
+                restore_error
+            ))),
+        }
     }
 
     fn build_prefixed_path(&self, prefix: &Path) -> Result<OsString> {
@@ -1366,11 +1485,14 @@ impl EnvironmentBackend for RattlerBackend {
 mod tests {
     use super::RattlerBackend;
     use crate::backend::{EnvironmentBackend, EnvironmentTarget, OutputMode, RunRequest};
+    use crate::ownership::write_rattler_ownership_record;
     use crate::package_manager::PackageManager;
     use crate::prefix_registry::{DiscoveredEnvironment, EnvironmentOwner, EnvironmentSource};
+    use rattler_conda_types::{PackageName, PackageRecord, PrefixRecord, RepoDataRecord, Version};
     use rattler_solve::ChannelPriority;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::str::FromStr;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
 
@@ -1390,6 +1512,32 @@ mod tests {
             "created-by-test\n",
         )
         .unwrap();
+    }
+
+    fn write_fake_prefix_record(prefix: &Path, name: &str) {
+        let package_record = PackageRecord::new(
+            PackageName::new_unchecked(name),
+            Version::from_str("1.0.0").unwrap(),
+            "h123_0".to_string(),
+        );
+        let repodata_record = RepoDataRecord {
+            package_record,
+            identifier: format!("{name}-1.0.0-h123_0.conda").parse().unwrap(),
+            url: format!(
+                "https://conda.anaconda.org/conda-forge/linux-64/{name}-1.0.0-h123_0.conda"
+            )
+            .parse()
+            .unwrap(),
+            channel: Some("https://conda.anaconda.org/conda-forge/".to_string()),
+        };
+        PrefixRecord::from_repodata_record(repodata_record, vec![])
+            .write_to_path(
+                prefix
+                    .join("conda-meta")
+                    .join(format!("{name}-1.0.0-h123_0.json")),
+                true,
+            )
+            .unwrap();
     }
 
     fn discovered_environment(
@@ -1562,6 +1710,52 @@ mod tests {
     }
 
     #[test]
+    fn owned_environment_records_preserve_adopted_source() {
+        let _guard = env_lock().lock().unwrap();
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("micromamba-root");
+        let env_prefix = root.join("envs").join("demo");
+        create_fake_environment(&env_prefix);
+        write_rattler_ownership_record(&env_prefix, Some("micromamba")).unwrap();
+
+        let backend = backend_with_root(&root);
+        let records = backend.owned_environment_records().unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].owner, EnvironmentOwner::Rattler);
+        assert_eq!(
+            records[0].source,
+            EnvironmentSource::PackageManager(PackageManager::Micromamba)
+        );
+        assert_eq!(
+            records[0].adopted_from,
+            Some(EnvironmentSource::PackageManager(
+                PackageManager::Micromamba
+            ))
+        );
+    }
+
+    #[test]
+    fn owned_environment_records_leave_unowned_prefixes_external() {
+        let _guard = env_lock().lock().unwrap();
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("active-root");
+        let env_prefix = root.join("envs").join("demo");
+        create_fake_environment(&env_prefix);
+
+        let backend = backend_with_root(&root);
+        let records = backend.owned_environment_records().unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].owner, EnvironmentOwner::External);
+        assert_eq!(
+            records[0].source,
+            EnvironmentSource::PackageManager(PackageManager::None)
+        );
+        assert_eq!(records[0].adopted_from, None);
+    }
+
+    #[test]
     fn helper_package_manager_uses_adopted_source_for_rattler_owned_environment() {
         let environment = discovered_environment_with_owner(
             "demo",
@@ -1596,6 +1790,45 @@ mod tests {
 
         assert_eq!(RattlerBackend::helper_package_manager(&environment), None);
         assert!(RattlerBackend::has_native_rattler_conflict(&environment));
+    }
+
+    #[test]
+    fn collect_installed_prefix_records_ignores_ownership_marker() {
+        let _guard = env_lock().lock().unwrap();
+        let tempdir = tempdir().unwrap();
+        let prefix = tempdir.path().join("envs").join("demo");
+        create_fake_environment(&prefix);
+        write_fake_prefix_record(&prefix, "python");
+        write_rattler_ownership_record(&prefix, Some("micromamba")).unwrap();
+
+        let records = RattlerBackend::collect_installed_prefix_records(&prefix).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0]
+                .repodata_record
+                .package_record
+                .name
+                .as_normalized(),
+            "python"
+        );
+    }
+
+    #[test]
+    fn ownership_marker_can_be_stashed_and_restored() {
+        let _guard = env_lock().lock().unwrap();
+        let tempdir = tempdir().unwrap();
+        let prefix = tempdir.path().join("envs").join("demo");
+        create_fake_environment(&prefix);
+        write_fake_prefix_record(&prefix, "python");
+        write_rattler_ownership_record(&prefix, Some("micromamba")).unwrap();
+
+        let stashed = RattlerBackend::stash_ownership_marker(&prefix).unwrap();
+        assert!(stashed.is_some());
+        assert!(!prefix.join("conda-meta").join("enva-rattler.json").exists());
+
+        RattlerBackend::restore_ownership_marker(&prefix, stashed).unwrap();
+        assert!(prefix.join("conda-meta").join("enva-rattler.json").exists());
     }
 
     #[test]
