@@ -11,15 +11,16 @@ use async_trait::async_trait;
 use rattler::install::Installer;
 use rattler::package_cache::PackageCache;
 use rattler_conda_types::{
-    Channel, ChannelConfig, EnvironmentYaml, MatchSpec, Platform, RepoDataRecord,
+    Channel, ChannelConfig, EnvironmentYaml, MatchSpec, Platform, PrefixRecord, RepoDataRecord,
 };
 use rattler_repodata_gateway::{Gateway, RepoData};
 use rattler_solve::{resolvo::Solver as RattlerSolver, ChannelPriority, SolverImpl, SolverTask};
 use rattler_virtual_packages::{VirtualPackage, VirtualPackageOverrides};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::fs as async_fs;
 use tokio::process::Command as AsyncCommand;
@@ -169,6 +170,10 @@ impl RattlerBackend {
         environment_yaml.match_specs().cloned().collect()
     }
 
+    fn default_channels() -> Vec<String> {
+        vec!["conda-forge".to_string(), "bioconda".to_string()]
+    }
+
     fn default_channel_priority() -> ChannelPriority {
         ChannelPriority::Disabled
     }
@@ -182,21 +187,157 @@ impl RattlerBackend {
         ChannelConfig::default_with_root_dir(root_dir)
     }
 
+    fn resolve_channel_names(
+        channel_config: &ChannelConfig,
+        channel_names: Vec<String>,
+    ) -> Result<Vec<Channel>> {
+        channel_names
+            .into_iter()
+            .map(|channel| {
+                let channel_label = channel.to_string();
+                Channel::from_str(channel.as_str(), channel_config).map_err(|error| {
+                    EnvError::Validation(format!(
+                        "Failed to parse channel '{}': {}",
+                        channel_label, error
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn resolve_channels(
         yaml_file: &Path,
         environment_yaml: &EnvironmentYaml,
     ) -> Result<Vec<Channel>> {
         let channel_config = Self::resolve_channel_config(yaml_file);
-        environment_yaml
-            .channels
-            .clone()
-            .into_iter()
-            .map(|channel| {
-                let channel_label = channel.to_string();
-                channel.into_channel(&channel_config).map_err(|error| {
+        Self::resolve_channel_names(&channel_config, Self::extract_string_list(environment_yaml))
+    }
+
+    fn resolve_channels_for_prefix(
+        prefix: &Path,
+        channel_names: Vec<String>,
+    ) -> Result<Vec<Channel>> {
+        let channel_config = ChannelConfig::default_with_root_dir(prefix.to_path_buf());
+        Self::resolve_channel_names(&channel_config, channel_names)
+    }
+
+    fn exact_match_spec_for_record(record: &PrefixRecord) -> String {
+        format!(
+            "{} =={} {}",
+            record.repodata_record.package_record.name.as_normalized(),
+            record.repodata_record.package_record.version,
+            record.repodata_record.package_record.build
+        )
+    }
+
+    fn push_unique_string(values: &mut Vec<String>, seen: &mut HashSet<String>, value: String) {
+        if !value.trim().is_empty() && seen.insert(value.clone()) {
+            values.push(value);
+        }
+    }
+
+    fn requested_spec_strings_from_prefix_records(installed: &[PrefixRecord]) -> Vec<String> {
+        let mut specs = Vec::new();
+        let mut seen = HashSet::new();
+
+        for record in installed {
+            #[allow(deprecated)]
+            if let Some(requested_spec) = record.requested_spec.clone() {
+                Self::push_unique_string(&mut specs, &mut seen, requested_spec);
+            }
+
+            for requested_spec in &record.requested_specs {
+                Self::push_unique_string(&mut specs, &mut seen, requested_spec.clone());
+            }
+        }
+
+        if specs.is_empty() {
+            for record in installed {
+                Self::push_unique_string(
+                    &mut specs,
+                    &mut seen,
+                    Self::exact_match_spec_for_record(record),
+                );
+            }
+        }
+
+        specs
+    }
+
+    fn merge_requested_install_specs(
+        existing_specs: Vec<String>,
+        packages: &[String],
+    ) -> Vec<String> {
+        let mut merged = Vec::new();
+        let mut seen = HashSet::new();
+
+        for spec in existing_specs {
+            Self::push_unique_string(&mut merged, &mut seen, spec);
+        }
+
+        for package in packages {
+            Self::push_unique_string(&mut merged, &mut seen, package.clone());
+        }
+
+        merged
+    }
+
+    fn channel_hints_from_spec_strings(specs: &[String]) -> Vec<String> {
+        let mut channels = Vec::new();
+        let mut seen = HashSet::new();
+
+        for spec in specs {
+            if let Some((channel, _)) = spec.split_once("::") {
+                Self::push_unique_string(&mut channels, &mut seen, channel.trim().to_string());
+            }
+        }
+
+        channels
+    }
+
+    fn channel_hints_from_prefix_records(installed: &[PrefixRecord]) -> Vec<String> {
+        let mut channels = Vec::new();
+        let mut seen = HashSet::new();
+
+        for record in installed {
+            if let Some(channel) = record.repodata_record.channel.clone() {
+                Self::push_unique_string(&mut channels, &mut seen, channel);
+            }
+        }
+
+        channels
+    }
+
+    fn install_channel_hints(
+        installed: &[PrefixRecord],
+        requested_specs: &[String],
+    ) -> Vec<String> {
+        let mut channels = Vec::new();
+        let mut seen = HashSet::new();
+
+        for channel in Self::channel_hints_from_prefix_records(installed) {
+            Self::push_unique_string(&mut channels, &mut seen, channel);
+        }
+
+        for channel in Self::channel_hints_from_spec_strings(requested_specs) {
+            Self::push_unique_string(&mut channels, &mut seen, channel);
+        }
+
+        if channels.is_empty() {
+            return Self::default_channels();
+        }
+
+        channels
+    }
+
+    fn parse_match_specs(spec_strings: &[String]) -> Result<Vec<MatchSpec>> {
+        spec_strings
+            .iter()
+            .map(|spec| {
+                <MatchSpec as FromStr>::from_str(spec).map_err(|error| {
                     EnvError::Validation(format!(
-                        "Failed to parse channel '{}': {}",
-                        channel_label, error
+                        "Failed to parse package spec '{}': {}",
+                        spec, error
                     ))
                 })
             })
@@ -678,6 +819,104 @@ impl RattlerBackend {
         Ok(())
     }
 
+    async fn solve_package_specs(
+        &self,
+        prefix: &Path,
+        channel_names: Vec<String>,
+        specs: Vec<MatchSpec>,
+    ) -> Result<Vec<RepoDataRecord>> {
+        let channels = Self::resolve_channels_for_prefix(prefix, channel_names)?;
+        let virtual_packages = Self::detect_virtual_packages()?;
+        let platforms = [Platform::current(), Platform::NoArch];
+
+        let cache_root = Self::cache_root_dir()?;
+        let repo_data_sets: Vec<RepoData> = Gateway::builder()
+            .with_cache_dir(cache_root.clone())
+            .with_package_cache(PackageCache::new(Self::package_cache_dir(&cache_root)))
+            .finish()
+            .query(channels, platforms, specs.clone())
+            .recursive(true)
+            .execute()
+            .await
+            .map_err(|error| {
+                EnvError::Execution(format!("Failed to fetch repodata for solve: {}", error))
+            })?;
+
+        if repo_data_sets.iter().all(RepoData::is_empty) {
+            return Err(EnvError::Execution(
+                "No package metadata was returned for the requested channels and specs".to_string(),
+            ));
+        }
+
+        let mut solver = RattlerSolver::default();
+        let solved = solver
+            .solve(SolverTask {
+                specs,
+                virtual_packages,
+                channel_priority: Self::default_channel_priority(),
+                ..SolverTask::from_iter(repo_data_sets.iter())
+            })
+            .map_err(|error| {
+                EnvError::Execution(format!("Failed to solve environment: {}", error))
+            })?;
+
+        Ok(solved.records)
+    }
+
+    async fn install_packages_by_prefix_natively(
+        &self,
+        prefix: &Path,
+        packages: &[String],
+    ) -> Result<()> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        if !Self::is_environment_prefix(prefix) {
+            return Err(EnvError::Execution(format!(
+                "Environment prefix is not a valid conda-style environment: {}",
+                prefix.display()
+            )));
+        }
+
+        let installed = PrefixRecord::collect_from_prefix(prefix).map_err(|error| {
+            EnvError::FileOperation(format!(
+                "Failed to read installed packages from {}: {}",
+                prefix.display(),
+                error
+            ))
+        })?;
+        let requested_spec_strings = Self::merge_requested_install_specs(
+            Self::requested_spec_strings_from_prefix_records(&installed),
+            packages,
+        );
+        let requested_specs = Self::parse_match_specs(&requested_spec_strings)?;
+        let solved_records = self
+            .solve_package_specs(
+                prefix,
+                Self::install_channel_hints(&installed, &requested_spec_strings),
+                requested_specs.clone(),
+            )
+            .await?;
+
+        let cache_root = Self::cache_root_dir()?;
+        Installer::new()
+            .with_package_cache(PackageCache::new(Self::package_cache_dir(&cache_root)))
+            .with_installed_packages(installed)
+            .with_requested_specs(requested_specs)
+            .install(prefix, solved_records)
+            .await
+            .map_err(|error| {
+                EnvError::Execution(format!(
+                    "Failed to install solved packages into {}: {}",
+                    prefix.display(),
+                    error
+                ))
+            })?;
+
+        Ok(())
+    }
+
     fn build_prefixed_path(&self, prefix: &Path) -> Result<OsString> {
         let mut path_entries = Vec::new();
         path_entries.push(prefix.join("bin"));
@@ -1003,6 +1242,13 @@ impl EnvironmentBackend for RattlerBackend {
                 OutputMode::Summary,
             )
             .await?;
+
+        if Self::helper_package_manager(&environment).is_none() {
+            return self
+                .install_packages_by_prefix_natively(&environment.prefix, packages)
+                .await;
+        }
+
         let manager = self.helper_manager_for_environment(&environment).await?;
         manager
             .install_packages_by_prefix(&environment.prefix, packages)
@@ -1343,6 +1589,47 @@ mod tests {
 
         assert_eq!(RattlerBackend::helper_package_manager(&environment), None);
         assert!(RattlerBackend::has_native_rattler_conflict(&environment));
+    }
+
+    #[test]
+    fn merge_requested_install_specs_deduplicates_and_appends_new_packages() {
+        let merged = RattlerBackend::merge_requested_install_specs(
+            vec!["python=3.10".to_string(), "samtools>=1.18".to_string()],
+            &["samtools>=1.18".to_string(), "bioconda::htseq".to_string()],
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                "python=3.10".to_string(),
+                "samtools>=1.18".to_string(),
+                "bioconda::htseq".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn install_channel_hints_fall_back_to_defaults() {
+        let channels = RattlerBackend::install_channel_hints(&[], &[]);
+
+        assert_eq!(
+            channels,
+            vec!["conda-forge".to_string(), "bioconda".to_string()]
+        );
+    }
+
+    #[test]
+    fn channel_hints_from_spec_strings_keep_explicit_channels() {
+        let channels = RattlerBackend::channel_hints_from_spec_strings(&[
+            "conda-forge::python=3.10".to_string(),
+            "bioconda::htseq".to_string(),
+            "samtools>=1.18".to_string(),
+        ]);
+
+        assert_eq!(
+            channels,
+            vec!["conda-forge".to_string(), "bioconda".to_string()]
+        );
     }
 
     #[test]

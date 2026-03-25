@@ -401,6 +401,14 @@ impl MicromambaManager {
         &self.config_dir
     }
 
+    fn null_device_path() -> &'static str {
+        if cfg!(windows) {
+            "NUL"
+        } else {
+            "/dev/null"
+        }
+    }
+
     /// Build environment variables for package-manager subprocess execution
     fn build_env_vars(&self) -> HashMap<String, String> {
         let mut env_vars = HashMap::new();
@@ -435,6 +443,8 @@ impl MicromambaManager {
         env_vars.insert("MAMBA_ROOT_PREFIX".to_string(), mamba_root_str.clone());
         env_vars.insert("CONDA_PREFIX".to_string(), mamba_root_str.clone());
         env_vars.insert("CONDA_DEFAULT_ENV".to_string(), "base".to_string());
+        env_vars.insert("CONDARC".to_string(), Self::null_device_path().to_string());
+        env_vars.insert("MAMBARC".to_string(), Self::null_device_path().to_string());
 
         env_vars
     }
@@ -1683,7 +1693,6 @@ impl MicromambaManager {
         cmd.arg("install")
             .arg("-p")
             .arg(prefix)
-            .arg("--no-rc")
             .arg("--override-channels")
             .arg("-c")
             .arg("conda-forge")
