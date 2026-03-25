@@ -512,7 +512,15 @@ async fn execute_env_install(args: EnvInstallArgs, verbose: bool) -> Result<()> 
     }
 
     match backend
-        .install_packages(env_name, &packages_to_install)
+        .install_packages(
+            env_name,
+            &packages_to_install,
+            if verbose {
+                OutputMode::Stream
+            } else {
+                OutputMode::Summary
+            },
+        )
         .await
     {
         Ok(_) => {

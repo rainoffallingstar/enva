@@ -23,14 +23,20 @@ jobs:
             yaml: src/configs/xdxtools-core.yaml
             env_name: xdxtools-core-ci
             probe: "samtools --version | head -n 1"
+            install_specs: "conda-forge::jq,bioconda::seqtk"
+            install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
           - label: xdxtools-snakemake
             yaml: src/configs/xdxtools-snakemake.yaml
             env_name: xdxtools-snakemake-ci
             probe: "snakemake --version"
+            install_specs: "conda-forge::jq,bioconda::seqtk"
+            install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
           - label: xdxtools-extra
             yaml: src/configs/xdxtools-extra.yaml
             env_name: xdxtools-extra-ci
             probe: "bedtools --version"
+            install_specs: "conda-forge::jq,bioconda::seqtk"
+            install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
     env:
       CARGO_TERM_COLOR: always
       ENVA_PACKAGE_MANAGER: micromamba
@@ -87,12 +93,12 @@ jobs:
           ./target/release/enva validate --name "${{ matrix.env_name }}" \
             2>&1 | tee "ci-logs/${{ matrix.label }}-validate.log"
 
-      - name: Install single package into environment
+      - name: Install multiple mixed-source packages into environment
         shell: bash
         run: |
           set -euo pipefail
           export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
-          ./target/release/enva install --name "${{ matrix.env_name }}" jq \
+          ./target/release/enva install --name "${{ matrix.env_name }}" "${{ matrix.install_specs }}" \
             2>&1 | tee "ci-logs/${{ matrix.label }}-install.log"
 
       - name: Run smoke command inside environment
@@ -105,14 +111,14 @@ jobs:
             --command "${{ matrix.probe }}" \
             2>&1 | tee "ci-logs/${{ matrix.label }}-run.log"
 
-      - name: Verify installed package inside environment
+      - name: Verify installed mixed-source packages inside environment
         shell: bash
         run: |
           set -euo pipefail
           export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
           ./target/release/enva run \
             --name "${{ matrix.env_name }}" \
-            --command 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version' \
+            --command '${{ matrix.install_verify }}' \
             2>&1 | tee "ci-logs/${{ matrix.label }}-install-verify.log"
 
       - name: Remove rattler-managed environment
@@ -204,12 +210,12 @@ jobs:
           ./target/release/enva validate --name enva-adopt-ci \
             2>&1 | tee "ci-logs/adopt-validate.log"
 
-      - name: Install single package into adopted environment
+      - name: Install multiple mixed-source packages into adopted environment
         shell: bash
         run: |
           set -euo pipefail
           export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
-          ./target/release/enva install --name enva-adopt-ci jq \
+          ./target/release/enva install --name enva-adopt-ci "conda-forge::jq,bioconda::seqtk" \
             2>&1 | tee "ci-logs/adopt-install.log"
 
       - name: Run smoke commands inside adopted environment
@@ -223,8 +229,8 @@ jobs:
             2>&1 | tee "ci-logs/adopt-run-python.log"
           ./target/release/enva run \
             --name enva-adopt-ci \
-            --command 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version' \
-            2>&1 | tee "ci-logs/adopt-run-jq.log"
+            --command 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"' \
+            2>&1 | tee "ci-logs/adopt-run-install-verify.log"
 
       - name: Remove adopted environment via helper manager
         shell: bash

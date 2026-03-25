@@ -1708,7 +1708,12 @@ impl MicromambaManager {
     }
 
     /// Install packages in environment
-    pub async fn install_packages(&self, env_name: &str, packages: &[String]) -> Result<()> {
+    pub async fn install_packages(
+        &self,
+        env_name: &str,
+        packages: &[String],
+        output_mode: OutputMode,
+    ) -> Result<()> {
         if !self.environment_exists(env_name).await? {
             return Err(EnvError::Execution(format!(
                 "Environment '{}' does not exist. Please create it first using 'xdxtools env create --name {}'",
@@ -1729,13 +1734,15 @@ impl MicromambaManager {
                 ))
             })?;
 
-        self.install_packages_by_prefix(&prefix, packages).await
+        self.install_packages_by_prefix(&prefix, packages, output_mode)
+            .await
     }
 
     pub async fn install_packages_by_prefix(
         &self,
         prefix: &Path,
         packages: &[String],
+        output_mode: OutputMode,
     ) -> Result<()> {
         use tokio::process::Command as AsyncCommand;
 
@@ -1759,6 +1766,16 @@ impl MicromambaManager {
         );
         debug!("package manager path: {:?}", self.pm_path);
 
+        let progress = if matches!(output_mode, OutputMode::Summary) {
+            Some(Self::summary_spinner(format!(
+                "Installing packages into {} via {}...",
+                prefix.display(),
+                self.pm_type
+            ))?)
+        } else {
+            None
+        };
+
         let mut cmd = AsyncCommand::new(&self.pm_path);
         cmd.arg("install")
             .arg("-p")
@@ -1774,38 +1791,61 @@ impl MicromambaManager {
             cmd.arg(package);
         }
 
-        cmd.stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit());
-
-        self.apply_env_to_command(&mut cmd);
-
         let stashed_ownership_marker = Self::stash_ownership_marker(prefix)?;
-        let install_result = cmd.status().await.map_err(|e| {
-            EnvError::Execution(format!("Failed to execute {} install: {}", self.pm_type, e))
-        });
+        let output_result = match output_mode {
+            OutputMode::Stream => {
+                println!(
+                    "Installing packages into {} via {}...",
+                    prefix.display(),
+                    self.pm_type
+                );
+                cmd.stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit());
+                self.apply_env_to_command(&mut cmd);
+                cmd.status()
+                    .await
+                    .map(|status| std::process::Output {
+                        status,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    })
+                    .map_err(|e| {
+                        EnvError::Execution(format!(
+                            "Failed to execute {} install: {}",
+                            self.pm_type, e
+                        ))
+                    })
+            }
+            OutputMode::Summary | OutputMode::Quiet => {
+                cmd.stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                self.apply_env_to_command(&mut cmd);
+                cmd.output().await.map_err(|e| {
+                    EnvError::Execution(format!(
+                        "Failed to execute {} install: {}",
+                        self.pm_type, e
+                    ))
+                })
+            }
+        };
+
         let restore_result = Self::restore_ownership_marker(prefix, stashed_ownership_marker);
 
-        match (install_result, restore_result) {
-            (Ok(status), Ok(())) if status.success() => {
-                info!(
-                    "Successfully installed packages in environment prefix '{}'",
-                    prefix.display()
-                );
-                Ok(())
-            }
-            (Ok(status), Ok(())) => Err(EnvError::Execution(format!(
+        let result = match (output_result, restore_result) {
+            (Ok(output), Ok(())) if output.status.success() => Ok(output),
+            (Ok(output), Ok(())) => Err(EnvError::Execution(format!(
                 "Failed to install packages into {} using {}: exit code {:?}",
                 prefix.display(),
                 self.pm_type,
-                status.code()
+                output.status.code()
             ))),
             (Err(error), Ok(())) => Err(error),
-            (Ok(status), Err(error)) if status.success() => Err(error),
-            (Ok(status), Err(error)) => Err(EnvError::Execution(format!(
+            (Ok(output), Err(error)) if output.status.success() => Err(error),
+            (Ok(output), Err(error)) => Err(EnvError::Execution(format!(
                 "Failed to install packages into {} using {}: exit code {:?}; additionally failed to restore enva ownership marker: {}",
                 prefix.display(),
                 self.pm_type,
-                status.code(),
+                output.status.code(),
                 error
             ))),
             (Err(install_error), Err(restore_error)) => Err(EnvError::Execution(format!(
@@ -1814,6 +1854,36 @@ impl MicromambaManager {
                 prefix.display(),
                 restore_error
             ))),
+        };
+
+        match (&progress, &result) {
+            (Some(pb), Ok(_)) => pb.finish_and_clear(),
+            (Some(pb), Err(error)) => pb.abandon_with_message(format!(
+                "✗ Failed package install for {}: {}",
+                prefix.display(),
+                error
+            )),
+            _ => {}
+        }
+
+        match result {
+            Ok(output) => {
+                if matches!(output_mode, OutputMode::Summary) {
+                    println!("✓ Installed packages into {}", prefix.display());
+                }
+                if !output.stdout.is_empty() && matches!(output_mode, OutputMode::Stream) {
+                    print!("{}", String::from_utf8_lossy(&output.stdout));
+                }
+                if !output.stderr.is_empty() && matches!(output_mode, OutputMode::Stream) {
+                    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                }
+                info!(
+                    "Successfully installed packages in environment prefix '{}'",
+                    prefix.display()
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 

@@ -10,6 +10,7 @@ use crate::prefix_registry::{
     EnvironmentOwner, EnvironmentSource,
 };
 use async_trait::async_trait;
+use indicatif::{ProgressBar, ProgressStyle};
 use rattler::install::Installer;
 use rattler::package_cache::PackageCache;
 use rattler_conda_types::{
@@ -24,6 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs as async_fs;
 use tokio::process::Command as AsyncCommand;
 use tokio::sync::Mutex;
@@ -178,6 +180,20 @@ impl RattlerBackend {
 
     fn default_channel_priority() -> ChannelPriority {
         ChannelPriority::Disabled
+    }
+
+    fn summary_spinner(message: impl Into<String>) -> Result<ProgressBar> {
+        let pb = ProgressBar::new_spinner();
+        let style = ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .map_err(|error| {
+                EnvError::Template(format!("Failed to create progress spinner: {}", error))
+            })?
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+        pb.set_style(style);
+        pb.set_message(message.into());
+        pb.enable_steady_tick(Duration::from_millis(120));
+        Ok(pb)
     }
 
     fn resolve_channel_config(yaml_file: &Path) -> ChannelConfig {
@@ -973,6 +989,7 @@ impl RattlerBackend {
         &self,
         prefix: &Path,
         packages: &[String],
+        output_mode: OutputMode,
     ) -> Result<()> {
         if packages.is_empty() {
             return Ok(());
@@ -983,6 +1000,22 @@ impl RattlerBackend {
                 "Environment prefix is not a valid conda-style environment: {}",
                 prefix.display()
             )));
+        }
+
+        let progress = if matches!(output_mode, OutputMode::Summary) {
+            Some(Self::summary_spinner(format!(
+                "Resolving package install for {}...",
+                prefix.display()
+            ))?)
+        } else {
+            None
+        };
+
+        if matches!(output_mode, OutputMode::Stream) {
+            println!(
+                "Resolving package install for {} with rattler...",
+                prefix.display()
+            );
         }
 
         let installed = Self::collect_installed_prefix_records(prefix).map_err(|error| {
@@ -1005,6 +1038,21 @@ impl RattlerBackend {
             )
             .await?;
 
+        if let Some(pb) = &progress {
+            pb.set_message(format!(
+                "Installing {} packages into {}...",
+                solved_records.len(),
+                prefix.display()
+            ));
+        }
+        if matches!(output_mode, OutputMode::Stream) {
+            println!(
+                "Installing {} packages into {} with rattler...",
+                solved_records.len(),
+                prefix.display()
+            );
+        }
+
         let cache_root = Self::cache_root_dir()?;
         let stashed_ownership_marker = Self::stash_ownership_marker(prefix)?;
         let install_result = Installer::new()
@@ -1023,7 +1071,7 @@ impl RattlerBackend {
             });
         let restore_result = Self::restore_ownership_marker(prefix, stashed_ownership_marker);
 
-        match (install_result, restore_result) {
+        let result = match (install_result, restore_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) => Err(error),
             (Ok(()), Err(error)) => Err(error),
@@ -1033,7 +1081,24 @@ impl RattlerBackend {
                 prefix.display(),
                 restore_error
             ))),
+        };
+
+        if let Some(pb) = progress {
+            match &result {
+                Ok(()) => pb.finish_and_clear(),
+                Err(error) => pb.abandon_with_message(format!(
+                    "✗ Failed package install for {}: {}",
+                    prefix.display(),
+                    error
+                )),
+            }
         }
+
+        if result.is_ok() && matches!(output_mode, OutputMode::Summary) {
+            println!("✓ Installed packages into {}", prefix.display());
+        }
+
+        result
     }
 
     fn build_prefixed_path(&self, prefix: &Path) -> Result<OsString> {
@@ -1191,19 +1256,39 @@ impl EnvironmentBackend for RattlerBackend {
         output_mode: OutputMode,
     ) -> Result<()> {
         let _lock = self.creation_lock.lock().await;
+        let progress = if matches!(output_mode, OutputMode::Summary) {
+            Some(Self::summary_spinner(format!(
+                "Preparing environment {}...",
+                env_name
+            ))?)
+        } else {
+            None
+        };
 
         if dry_run {
+            if let Some(pb) = &progress {
+                pb.set_message(format!("Validating YAML for {}...", env_name));
+            }
             let validation = self.validate_yaml(yaml_file).await?;
+            if let Some(pb) = progress {
+                pb.finish_and_clear();
+            }
             println!("{}", serde_json::to_string_pretty(&validation)?);
             return Ok(());
         }
 
+        if let Some(pb) = &progress {
+            pb.set_message(format!("Validating YAML for {}...", env_name));
+        }
         let environment_yaml = Self::parse_environment_yaml(yaml_file)?;
         let issues = Self::environment_issues(&environment_yaml);
         if !issues.is_empty() {
             return Err(EnvError::Validation(issues.join("; ")));
         }
 
+        if let Some(pb) = &progress {
+            pb.set_message(format!("Resolving target prefix for {}...", env_name));
+        }
         let target_prefix = self.target_prefix_for_env_name(env_name)?;
         let conflicting_environments =
             Self::prioritize_named_records(env_name, self.accessible_environment_records().await?)
@@ -1241,7 +1326,15 @@ impl EnvironmentBackend for RattlerBackend {
             }
 
             for environment in &conflicting_environments {
-                if matches!(output_mode, OutputMode::Summary | OutputMode::Stream) {
+                if let Some(pb) = &progress {
+                    pb.set_message(format!(
+                        "Removing conflicting {} environment '{}'...",
+                        Self::removable_conflict_manager_label(environment)
+                            .unwrap_or_else(|| "rattler".to_string()),
+                        env_name
+                    ));
+                }
+                if matches!(output_mode, OutputMode::Stream) {
                     println!(
                         "Removing conflicting {} environment '{}' at {} before rattler create...",
                         Self::removable_conflict_manager_label(environment)
@@ -1258,7 +1351,10 @@ impl EnvironmentBackend for RattlerBackend {
         if target_prefix.exists() {
             if Self::is_environment_prefix(&target_prefix) {
                 if force {
-                    if matches!(output_mode, OutputMode::Summary | OutputMode::Stream) {
+                    if let Some(pb) = &progress {
+                        pb.set_message(format!("Removing existing environment {}...", env_name));
+                    }
+                    if matches!(output_mode, OutputMode::Stream) {
                         println!(
                             "Removing existing rattler environment '{}' at {}",
                             env_name,
@@ -1288,13 +1384,23 @@ impl EnvironmentBackend for RattlerBackend {
             }
         }
 
-        if matches!(output_mode, OutputMode::Summary | OutputMode::Stream) {
+        if let Some(pb) = &progress {
+            pb.set_message(format!("Solving environment {} with rattler...", env_name));
+        }
+        if matches!(output_mode, OutputMode::Stream) {
             println!("Solving environment {} with rattler...", env_name);
         }
         let (requested_specs, solved_records) =
             self.solve_environment(yaml_file, &environment_yaml).await?;
 
-        if matches!(output_mode, OutputMode::Summary | OutputMode::Stream) {
+        if let Some(pb) = &progress {
+            pb.set_message(format!(
+                "Installing {} solved packages into {}...",
+                solved_records.len(),
+                target_prefix.display()
+            ));
+        }
+        if matches!(output_mode, OutputMode::Stream) {
             println!(
                 "Installing {} solved packages into {}...",
                 solved_records.len(),
@@ -1303,26 +1409,41 @@ impl EnvironmentBackend for RattlerBackend {
         }
 
         let cache_root = Self::cache_root_dir()?;
-        Installer::new()
+        let install_result = Installer::new()
             .with_package_cache(PackageCache::new(Self::package_cache_dir(&cache_root)))
             .with_requested_specs(requested_specs)
             .install(&target_prefix, solved_records)
             .await
+            .map(|_| ())
             .map_err(|error| {
                 EnvError::Execution(format!(
                     "Failed to install solved packages into {}: {}",
                     target_prefix.display(),
                     error
                 ))
-            })?;
+            });
 
-        write_rattler_ownership_record(&target_prefix, None)?;
-
-        if matches!(output_mode, OutputMode::Summary) {
-            println!("✓ Environment {} created", env_name);
+        match install_result {
+            Ok(()) => {
+                write_rattler_ownership_record(&target_prefix, None)?;
+                if let Some(pb) = progress {
+                    pb.finish_and_clear();
+                }
+                if matches!(output_mode, OutputMode::Summary) {
+                    println!("✓ Environment {} created", env_name);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(pb) = progress {
+                    pb.abandon_with_message(format!(
+                        "✗ Failed to create environment {}: {}",
+                        env_name, error
+                    ));
+                }
+                Err(error)
+            }
         }
-
-        Ok(())
     }
 
     async fn validate_yaml(&self, yaml_file: &Path) -> Result<ValidationResult> {
@@ -1354,23 +1475,25 @@ impl EnvironmentBackend for RattlerBackend {
         Ok(!self.find_environment_prefixes(env_name).await?.is_empty())
     }
 
-    async fn install_packages(&self, env_name: &str, packages: &[String]) -> Result<()> {
+    async fn install_packages(
+        &self,
+        env_name: &str,
+        packages: &[String],
+        output_mode: OutputMode,
+    ) -> Result<()> {
         let environment = self
-            .ensure_adopted_environment(
-                &EnvironmentTarget::Name(env_name.to_string()),
-                OutputMode::Summary,
-            )
+            .ensure_adopted_environment(&EnvironmentTarget::Name(env_name.to_string()), output_mode)
             .await?;
 
         if Self::helper_package_manager(&environment).is_none() {
             return self
-                .install_packages_by_prefix_natively(&environment.prefix, packages)
+                .install_packages_by_prefix_natively(&environment.prefix, packages, output_mode)
                 .await;
         }
 
         let manager = self.helper_manager_for_environment(&environment).await?;
         manager
-            .install_packages_by_prefix(&environment.prefix, packages)
+            .install_packages_by_prefix(&environment.prefix, packages, output_mode)
             .await
     }
 

@@ -75,9 +75,16 @@ impl EnvironmentBackend for CliBackend {
         manager.environment_exists(env_name).await
     }
 
-    async fn install_packages(&self, env_name: &str, packages: &[String]) -> Result<()> {
+    async fn install_packages(
+        &self,
+        env_name: &str,
+        packages: &[String],
+        output_mode: OutputMode,
+    ) -> Result<()> {
         let manager = self.runtime_manager().await?;
-        manager.install_packages(env_name, packages).await
+        manager
+            .install_packages(env_name, packages, output_mode)
+            .await
     }
 
     async fn adopt_environment(
