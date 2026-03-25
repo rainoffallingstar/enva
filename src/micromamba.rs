@@ -1683,6 +1683,8 @@ impl MicromambaManager {
         cmd.arg("install")
             .arg("-p")
             .arg(prefix)
+            .arg("--no-rc")
+            .arg("--override-channels")
             .arg("-c")
             .arg("conda-forge")
             .arg("-c")
@@ -1857,29 +1859,38 @@ dependencies:
 
         debug!("Executing {} env list", self.pm_type);
 
-        let mut cmd = tokio::process::Command::new(&self.pm_path);
-        cmd.arg("env").arg("list");
-        self.apply_env_to_command(&mut cmd);
-
-        let output = cmd.output().await.map_err(|e| {
-            EnvError::Execution(format!("Failed to execute {}: {}", self.pm_type, e))
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(EnvError::Execution(format!(
-                "Failed to list environments via {}: {}",
-                self.pm_type, stderr
-            )));
-        }
-
-        let mut environments = parse_conda_env_list(&output.stdout)?;
+        let active_prefix = std::env::var("CONDA_PREFIX").ok();
+        let base_prefix = self.get_base_environment_prefix();
         let source = self.pm_type.to_string();
-        for environment in &mut environments {
-            environment.source = Some(source.clone());
-        }
 
-        Ok(environments)
+        Ok(self
+            .list_environment_prefixes()
+            .await?
+            .into_iter()
+            .map(|prefix| {
+                let name = if prefix == base_prefix {
+                    "base".to_string()
+                } else {
+                    prefix
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("unknown")
+                        .to_string()
+                };
+
+                CondaEnvironment {
+                    name,
+                    prefix: prefix.display().to_string(),
+                    is_active: active_prefix
+                        .as_deref()
+                        .map(|active| Path::new(active) == prefix)
+                        .unwrap_or(false),
+                    source: Some(source.clone()),
+                    owner: None,
+                    adopted_from: None,
+                }
+            })
+            .collect())
     }
 }
 
@@ -1898,64 +1909,6 @@ pub struct CondaEnvironment {
     pub owner: Option<String>,
     /// Original package manager source when a foreign environment was adopted by rattler
     pub adopted_from: Option<String>,
-}
-
-/// Parse conda env list output
-///
-/// Expected format:
-/// ```text
-/// # conda environments:
-/// #
-/// base                  * /path/to/miniconda3
-/// env1                     /path/to/miniconda3/envs/env1
-/// env2                     /path/to/miniconda3/envs/env2
-/// ```
-fn parse_conda_env_list(output: &[u8]) -> Result<Vec<CondaEnvironment>> {
-    let content = String::from_utf8_lossy(output);
-    let mut environments = Vec::new();
-
-    for line in content.lines() {
-        // Skip comments and empty lines
-        if line.starts_with('#') || line.trim().is_empty() {
-            continue;
-        }
-
-        // Parse line: name * /path/to/env
-        // The second field (*) indicates the active environment
-        let parts: Vec<&str> = line.split_whitespace().collect();
-
-        if parts.len() >= 2 {
-            let name = parts[0].to_string();
-
-            // Check if this is the active environment
-            let is_active = parts.get(1).map(|&s| s == "*").unwrap_or(false);
-
-            // The prefix is the last field (after potential * marker)
-            // Format: name [*] prefix
-            let prefix = if is_active {
-                // "name * /path" -> parts.len() >= 3
-                if parts.len() >= 3 {
-                    parts[2].to_string()
-                } else {
-                    continue; // Invalid format
-                }
-            } else {
-                // "name /path" -> parts.len() >= 2
-                parts[1].to_string()
-            };
-
-            environments.push(CondaEnvironment {
-                name,
-                prefix,
-                is_active,
-                source: None,
-                owner: None,
-                adopted_from: None,
-            });
-        }
-    }
-
-    Ok(environments)
 }
 
 #[cfg(test)]

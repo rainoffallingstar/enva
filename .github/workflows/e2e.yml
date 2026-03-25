@@ -145,6 +145,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       ENVA_PACKAGE_MANAGER: micromamba
+      ENVA_RATTLER_ROOT_PREFIX: ${{ runner.temp }}/enva-adopt-rattler-root
       RUST_BACKTRACE: 1
     steps:
       - name: Checkout code
