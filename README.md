@@ -88,6 +88,9 @@ cargo build --release
 
 # Comma-separated input is also accepted
 ./enva install --name xdxtools-core fastqc,multiqc
+
+# Mixed-channel specs are accepted in the same command
+./enva install --name xdxtools-core conda-forge::jq,bioconda::seqtk
 ```
 
 ### Adopt or remove environments
@@ -114,6 +117,7 @@ cargo build --release
 - **Secondary path**: adopted or external environments discovered from `conda`, `mamba`, or `micromamba`
 - `ENVA_PACKAGE_MANAGER` is a compatibility hint for choosing which secondary package manager to inspect first
 - `ENVA_BACKEND=cli` is an expert-only compatibility mode; the normal default remains `rattler`
+- Rattler ownership metadata is stored in `conda-meta/enva-rattler.json`; when `enva` delegates install or remove operations to `micromamba`, `mamba`, or `conda`, that marker is temporarily stashed so libmamba-based tooling does not parse it as a package record
 
 Examples:
 
@@ -124,6 +128,15 @@ ENVA_PACKAGE_MANAGER=conda ENVA_BACKEND=cli enva run xdxtools-core -- fastqc --v
 # Force explicit compatibility mode for troubleshooting
 ENVA_BACKEND=cli enva list --detailed
 ```
+
+## Testing
+
+The e2e workflow covers:
+
+- `xdxtools-core`, `xdxtools-snakemake`, and `xdxtools-extra`: create, list, validate, install extra packages, run smoke commands, and remove
+- Multi-package mixed-source installs through one command, including specs like `conda-forge::jq,bioconda::seqtk`
+- Adopted `micromamba` environments: adopt into rattler ownership, install extra packages through the compatibility layer, run commands, and remove through the helper package manager
+- Same-name replacement under an active `CONDA_PREFIX`, ensuring the active root prefix is preferred during `create --force`
 
 ## Limitations
 
