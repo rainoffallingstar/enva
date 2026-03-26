@@ -334,6 +334,33 @@ async fn resolve_environment_target(
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedEnvironmentReference {
+    pub prefix: PathBuf,
+}
+
+pub(crate) async fn resolve_environment_reference(
+    env_name: Option<&str>,
+    prefix: Option<&Path>,
+    requested_pm: Option<PackageManager>,
+) -> Result<ResolvedEnvironmentReference> {
+    let selector = BackendSelector::from_env();
+    let resolved = if let Some(explicit_prefix) = prefix {
+        resolve_environment_target(explicit_prefix, selector, requested_pm).await?
+    } else {
+        resolve_environment_by_name(
+            env_name.ok_or_else(|| EnvError::Validation("Missing environment name".to_string()))?,
+            selector,
+            requested_pm,
+        )
+        .await?
+    };
+
+    Ok(ResolvedEnvironmentReference {
+        prefix: resolved.prefix,
+    })
+}
+
 /// Execute environment run command
 pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
     validate_args(&args)?;

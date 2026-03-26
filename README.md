@@ -50,6 +50,9 @@ cargo build --release
 # Replace an existing environment and clean rattler caches first
 ./enva create --yaml ./src/configs/xdxtools-core.yaml --name xdxtools-core --force --clean-cache
 
+# Create and immediately install extra packages
+./enva create --core --with seqtk --with conda-forge::jq
+
 # Validate only
 ./enva --dry-run create --all
 ```
@@ -78,6 +81,39 @@ cargo build --release
 
 # Explicit prefix
 ./enva run --prefix /path/to/env -- fastqc --version
+```
+
+### Activate or deactivate a shell
+
+```bash
+# One-time shell integration in Bash / Zsh
+ eval "$(./enva shell hook bash)"
+
+# After the hook is loaded, these behave like native shell commands
+enva activate xdxtools-core
+enva deactivate
+
+# Direct one-shot activation still works
+ eval "$(./enva activate xdxtools-core)"
+ eval "$(./enva deactivate)"
+```
+
+```fish
+# Fish hook
+./enva shell hook fish | source
+
+# After the hook is loaded
+enva activate xdxtools-core
+enva deactivate
+```
+
+```powershell
+# PowerShell hook
+./enva shell hook powershell | Invoke-Expression
+
+# After the hook is loaded
+enva activate xdxtools-core
+enva deactivate
 ```
 
 ### Install packages
