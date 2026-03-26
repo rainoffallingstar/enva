@@ -109,6 +109,17 @@ impl EnvironmentBackend for CliBackend {
             .await
     }
 
+    async fn remove_environment_by_prefix_with_output(
+        &self,
+        prefix: &Path,
+        output_mode: OutputMode,
+    ) -> Result<()> {
+        let manager = self.runtime_manager().await?;
+        manager
+            .remove_environment_by_prefix_with_output(prefix, output_mode)
+            .await
+    }
+
     async fn get_all_conda_environments(&self) -> Result<Vec<CondaEnvironment>> {
         let manager = self.runtime_manager().await?;
         manager.get_all_conda_environments().await

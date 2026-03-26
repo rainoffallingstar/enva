@@ -47,6 +47,12 @@ pub trait EnvironmentBackend: Send + Sync {
         output_mode: OutputMode,
     ) -> Result<()>;
 
+    async fn remove_environment_by_prefix_with_output(
+        &self,
+        prefix: &Path,
+        output_mode: OutputMode,
+    ) -> Result<()>;
+
     async fn get_all_conda_environments(&self) -> Result<Vec<CondaEnvironment>>;
 
     async fn find_environment_prefixes(&self, env_name: &str) -> Result<Vec<PathBuf>>;

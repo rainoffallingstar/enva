@@ -616,6 +616,56 @@ impl RattlerBackend {
             .await
     }
 
+    async fn remove_resolved_environment(
+        &self,
+        environment: DiscoveredEnvironment,
+        display_name: &str,
+        output_mode: OutputMode,
+    ) -> Result<()> {
+        let prefix = environment.prefix.clone();
+        if self.root_prefixes.iter().any(|root| root == &prefix) {
+            return Err(EnvError::Execution(
+                "Refusing to remove the rattler base environment".to_string(),
+            ));
+        }
+
+        if Self::helper_package_manager(&environment).is_some() {
+            if matches!(output_mode, OutputMode::Stream | OutputMode::Summary) {
+                println!(
+                    "Removing adopted environment '{}' at {} via helper package manager",
+                    display_name,
+                    prefix.display()
+                );
+            }
+            let manager = self.helper_manager_for_environment(&environment).await?;
+            manager
+                .remove_environment_by_prefix_with_output(&prefix, output_mode)
+                .await?;
+        } else {
+            if matches!(output_mode, OutputMode::Stream | OutputMode::Summary) {
+                println!(
+                    "Removing rattler environment '{}' at {}",
+                    display_name,
+                    prefix.display()
+                );
+            }
+
+            async_fs::remove_dir_all(&prefix).await.map_err(|error| {
+                EnvError::FileOperation(format!(
+                    "Failed to remove rattler environment {}: {}",
+                    prefix.display(),
+                    error
+                ))
+            })?;
+
+            if matches!(output_mode, OutputMode::Summary) {
+                println!("✓ Environment {} removed", display_name);
+            }
+        }
+
+        Ok(())
+    }
+
     fn source_priority(source: &EnvironmentSource) -> u8 {
         match source {
             EnvironmentSource::Rattler => 0,
@@ -1514,48 +1564,24 @@ impl EnvironmentBackend for RattlerBackend {
         let environment = self
             .ensure_adopted_environment(&EnvironmentTarget::Name(env_name.to_string()), output_mode)
             .await?;
-        let prefix = environment.prefix.clone();
-        if self.root_prefixes.iter().any(|root| root == &prefix) {
-            return Err(EnvError::Execution(
-                "Refusing to remove the rattler base environment".to_string(),
-            ));
-        }
+        self.remove_resolved_environment(environment, env_name, output_mode)
+            .await
+    }
 
-        if let Some(_) = Self::helper_package_manager(&environment) {
-            if matches!(output_mode, OutputMode::Stream | OutputMode::Summary) {
-                println!(
-                    "Removing adopted environment '{}' at {} via helper package manager",
-                    env_name,
-                    prefix.display()
-                );
-            }
-            let manager = self.helper_manager_for_environment(&environment).await?;
-            manager
-                .remove_environment_by_prefix_with_output(&prefix, output_mode)
-                .await?;
-        } else {
-            if matches!(output_mode, OutputMode::Stream | OutputMode::Summary) {
-                println!(
-                    "Removing rattler environment '{}' at {}",
-                    env_name,
-                    prefix.display()
-                );
-            }
-
-            async_fs::remove_dir_all(&prefix).await.map_err(|error| {
-                EnvError::FileOperation(format!(
-                    "Failed to remove rattler environment {}: {}",
-                    prefix.display(),
-                    error
-                ))
-            })?;
-
-            if matches!(output_mode, OutputMode::Summary) {
-                println!("✓ Environment {} removed", env_name);
-            }
-        }
-
-        Ok(())
+    async fn remove_environment_by_prefix_with_output(
+        &self,
+        prefix: &Path,
+        output_mode: OutputMode,
+    ) -> Result<()> {
+        let environment = self
+            .ensure_adopted_environment(
+                &EnvironmentTarget::Prefix(prefix.to_path_buf()),
+                output_mode,
+            )
+            .await?;
+        let display_name = environment.name.clone();
+        self.remove_resolved_environment(environment, &display_name, output_mode)
+            .await
     }
 
     async fn get_all_conda_environments(&self) -> Result<Vec<CondaEnvironment>> {

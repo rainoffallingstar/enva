@@ -136,7 +136,10 @@ enva deactivate
 ./enva adopt --name xdxtools-core
 ./enva adopt --prefix /path/to/external/env
 
-# Remove an environment
+# Remove one or more environments
+./enva remove xdxtools-core xdxtools-extra
+
+# If the same name exists under multiple tools, enva enters an interactive selector
 ./enva remove xdxtools-core
 ```
 
@@ -177,7 +180,7 @@ The e2e workflow covers:
 ## Limitations
 
 - `pip:` subsections inside environment YAML files are intentionally rejected by the rattler backend
-- If multiple accessible environments share the same name, `enva` prioritizes rattler-owned prefixes and may ask you to disambiguate with `--prefix`
+- If multiple accessible environments share the same name, `enva remove` prompts you to choose specific prefixes interactively in a terminal
 
 ## Benchmarking
 
