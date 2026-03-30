@@ -2016,7 +2016,6 @@ dependencies:
   - xlsxwriter
   - go
   - rust
-  - cargo
   - deepTools=3.5.5
   - genrich=0.6
   - homer=4.11

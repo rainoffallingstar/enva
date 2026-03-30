@@ -36,7 +36,6 @@ dependencies:
   # Development Toolchain
   - go
   - rust
-  - cargo
 
   # Advanced ChIP-seq/ATAC-seq Tools
   - deepTools=3.5.5       # Coverage analysis and visualization
