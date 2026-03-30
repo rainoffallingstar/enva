@@ -33,6 +33,11 @@ dependencies:
   - openpyxl
   - xlsxwriter
 
+  # Development Toolchain
+  - go
+  - rust
+  - cargo
+
   # Advanced ChIP-seq/ATAC-seq Tools
   - deepTools=3.5.5       # Coverage analysis and visualization
   - genrich=0.6           # ATAC-seq peak calling

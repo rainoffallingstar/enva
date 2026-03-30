@@ -76,7 +76,7 @@ pub const TOOL_ENVIRONMENT_MAP: &[(&str, &str)] = &[
     ("deepTools", "xdxtools-extra"),
     ("genrich", "xdxtools-extra"),
     ("homer", "xdxtools-extra"),
-    // Data Science & Visualization -> xdxtools-extra (Python only)
+    // Data Science & Visualization -> xdxtools-extra
     ("jupyter", "xdxtools-extra"),
     ("jupyterlab", "xdxtools-extra"),
     ("flask", "xdxtools-extra"),
@@ -85,6 +85,12 @@ pub const TOOL_ENVIRONMENT_MAP: &[(&str, &str)] = &[
     ("scikit-learn", "xdxtools-extra"),
     ("scipy", "xdxtools-extra"),
     ("statsmodels", "xdxtools-extra"),
+    // Development Toolchain -> xdxtools-extra
+    ("go", "xdxtools-extra"),
+    ("gofmt", "xdxtools-extra"),
+    ("rust", "xdxtools-extra"),
+    ("rustc", "xdxtools-extra"),
+    ("cargo", "xdxtools-extra"),
 ];
 
 /// Micromamba environment configuration
@@ -2008,6 +2014,9 @@ dependencies:
   - beautifulsoup4
   - openpyxl
   - xlsxwriter
+  - go
+  - rust
+  - cargo
   - deepTools=3.5.5
   - genrich=0.6
   - homer=4.11
