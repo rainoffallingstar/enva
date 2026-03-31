@@ -899,17 +899,45 @@ impl RattlerBackend {
         }
     }
 
+    async fn resolve_environment_target(
+        &self,
+        target: &EnvironmentTarget,
+    ) -> Result<DiscoveredEnvironment> {
+        match target {
+            EnvironmentTarget::Name(env_name) => self.resolve_unique_record_by_name(env_name).await,
+            EnvironmentTarget::Prefix(prefix) => self.resolve_record_by_prefix(prefix).await,
+        }
+    }
+
+    fn is_ownership_marker_permission_denied(error: &EnvError) -> bool {
+        fn normalize(message: &str) -> String {
+            message.to_ascii_lowercase()
+        }
+
+        fn has_ownership_marker_hint(message: &str) -> bool {
+            normalize(message).contains("ownership marker")
+        }
+
+        fn has_permission_denied_hint(message: &str) -> bool {
+            let normalized = normalize(message);
+            normalized.contains("permission denied") || normalized.contains("os error 13")
+        }
+
+        match error {
+            EnvError::PermissionDenied(message) => has_ownership_marker_hint(message),
+            EnvError::FileOperation(message) => {
+                has_ownership_marker_hint(message) && has_permission_denied_hint(message)
+            }
+            _ => false,
+        }
+    }
+
     async fn ensure_adopted_environment(
         &self,
         target: &EnvironmentTarget,
         output_mode: OutputMode,
     ) -> Result<DiscoveredEnvironment> {
-        let environment = match target {
-            EnvironmentTarget::Name(env_name) => {
-                self.resolve_unique_record_by_name(env_name).await?
-            }
-            EnvironmentTarget::Prefix(prefix) => self.resolve_record_by_prefix(prefix).await?,
-        };
+        let environment = self.resolve_environment_target(target).await?;
 
         if environment.rattler_managed() {
             return Ok(environment);
@@ -917,6 +945,36 @@ impl RattlerBackend {
 
         self.adopt_discovered_environment(&environment, output_mode)
             .await
+    }
+
+    async fn ensure_removable_environment(
+        &self,
+        target: &EnvironmentTarget,
+        output_mode: OutputMode,
+    ) -> Result<DiscoveredEnvironment> {
+        let environment = self.resolve_environment_target(target).await?;
+
+        if environment.rattler_managed() {
+            return Ok(environment);
+        }
+
+        match self
+            .adopt_discovered_environment(&environment, output_mode)
+            .await
+        {
+            Ok(adopted) => Ok(adopted),
+            Err(error) if Self::is_ownership_marker_permission_denied(&error) => {
+                if matches!(output_mode, OutputMode::Summary | OutputMode::Stream) {
+                    println!(
+                        "Ownership marker for '{}' at {} is not writable; proceeding with direct removal",
+                        environment.name,
+                        environment.prefix.display()
+                    );
+                }
+                Ok(environment)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn default_local_cache_root() -> PathBuf {
@@ -1562,7 +1620,10 @@ impl EnvironmentBackend for RattlerBackend {
         output_mode: OutputMode,
     ) -> Result<()> {
         let environment = self
-            .ensure_adopted_environment(&EnvironmentTarget::Name(env_name.to_string()), output_mode)
+            .ensure_removable_environment(
+                &EnvironmentTarget::Name(env_name.to_string()),
+                output_mode,
+            )
             .await?;
         self.remove_resolved_environment(environment, env_name, output_mode)
             .await
@@ -1574,7 +1635,7 @@ impl EnvironmentBackend for RattlerBackend {
         output_mode: OutputMode,
     ) -> Result<()> {
         let environment = self
-            .ensure_adopted_environment(
+            .ensure_removable_environment(
                 &EnvironmentTarget::Prefix(prefix.to_path_buf()),
                 output_mode,
             )
@@ -1852,6 +1913,32 @@ mod tests {
         let backend = backend_with_root(&root);
         backend
             .remove_environment_with_output("test-env", OutputMode::Quiet)
+            .await
+            .unwrap();
+
+        assert!(!env_prefix.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remove_environment_with_output_continues_when_marker_write_is_denied() {
+        let _guard = env_lock().lock().unwrap();
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("rattler-root");
+        let env_prefix = root.join("envs").join("locked-env");
+        let conda_meta = env_prefix.join("conda-meta");
+        fs::create_dir_all(&conda_meta).unwrap();
+
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&conda_meta).unwrap().permissions();
+            permissions.set_mode(0o555);
+            fs::set_permissions(&conda_meta, permissions).unwrap();
+        }
+
+        let backend = backend_with_root(&root);
+        backend
+            .remove_environment_with_output("locked-env", OutputMode::Quiet)
             .await
             .unwrap();
 
