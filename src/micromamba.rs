@@ -38,6 +38,40 @@ static GLOBAL_INITIALIZED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(f
 static RUNTIME_MANAGER_CACHE: LazyLock<StdMutex<HashMap<PackageManager, MicromambaManager>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+const CAPTURED_FAILURE_OUTPUT_LIMIT_BYTES: usize = 16 * 1024;
+
+fn captured_output_tail(output: &[u8]) -> String {
+    let start_index: usize = output
+        .len()
+        .saturating_sub(CAPTURED_FAILURE_OUTPUT_LIMIT_BYTES);
+    let content: String = String::from_utf8_lossy(&output[start_index..])
+        .trim()
+        .to_string();
+    if content.is_empty() {
+        return String::new();
+    }
+    if start_index > 0 {
+        return format!(
+            "[truncated to last {CAPTURED_FAILURE_OUTPUT_LIMIT_BYTES} bytes]\n{content}"
+        );
+    }
+    content
+}
+
+fn captured_command_failure_detail(output: &Output) -> String {
+    let stderr: String = captured_output_tail(&output.stderr);
+    if !stderr.is_empty() {
+        return format!("; stderr: {stderr}");
+    }
+
+    let stdout: String = captured_output_tail(&output.stdout);
+    if !stdout.is_empty() {
+        return format!("; stdout: {stdout}");
+    }
+
+    String::new()
+}
+
 fn validate_micromamba_executable(path: &Path) -> Result<PathBuf> {
     let canonical_path = normalize_and_validate_path(path)?;
     let output = Command::new(&canonical_path)
@@ -1476,18 +1510,20 @@ impl MicromambaManager {
         let result = match (output_result, restore_result) {
             (Ok(output), Ok(())) if output.status.success() => Ok(output),
             (Ok(output), Ok(())) => Err(EnvError::Execution(format!(
-                "Failed to install packages into {} using {}: exit code {:?}",
+                "Failed to install packages into {} using {}: exit code {:?}{}",
                 prefix.display(),
                 self.pm_type,
-                output.status.code()
+                output.status.code(),
+                captured_command_failure_detail(&output)
             ))),
             (Err(error), Ok(())) => Err(error),
             (Ok(output), Err(error)) if output.status.success() => Err(error),
             (Ok(output), Err(error)) => Err(EnvError::Execution(format!(
-                "Failed to install packages into {} using {}: exit code {:?}; additionally failed to restore enva ownership marker: {}",
+                "Failed to install packages into {} using {}: exit code {:?}{}; additionally failed to restore enva ownership marker: {}",
                 prefix.display(),
                 self.pm_type,
                 output.status.code(),
+                captured_command_failure_detail(&output),
                 error
             ))),
             (Err(install_error), Err(restore_error)) => Err(EnvError::Execution(format!(
@@ -1749,6 +1785,37 @@ mod tests {
             creation_lock: Arc::new(Mutex::new(())),
             env_list_cache: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    #[test]
+    fn captured_failure_detail_prefers_stderr_and_truncates_tail() {
+        let mut stderr: Vec<u8> = vec![b'x'; CAPTURED_FAILURE_OUTPUT_LIMIT_BYTES + 8];
+        stderr.extend_from_slice(b"solver failure");
+        let output: Output = Output {
+            status: std::process::Command::new("false").status().unwrap(),
+            stdout: b"less useful stdout".to_vec(),
+            stderr,
+        };
+
+        let detail: String = captured_command_failure_detail(&output);
+        assert!(detail.contains("stderr"));
+        assert!(detail.contains("truncated"));
+        assert!(detail.contains("solver failure"));
+        assert!(!detail.contains("less useful stdout"));
+    }
+
+    #[test]
+    fn captured_failure_detail_falls_back_to_stdout() {
+        let output: Output = Output {
+            status: std::process::Command::new("false").status().unwrap(),
+            stdout: b"solver wrote to stdout".to_vec(),
+            stderr: Vec::new(),
+        };
+
+        assert_eq!(
+            captured_command_failure_detail(&output),
+            "; stdout: solver wrote to stdout"
+        );
     }
 
     #[tokio::test]

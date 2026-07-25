@@ -1544,6 +1544,31 @@ mod tests {
     }
 
     #[test]
+    fn install_command_accepts_multiple_specs_without_splitting_matchspec_commas() {
+        let cli = TestCli::try_parse_from([
+            "enva",
+            "install",
+            "conda-forge::jq",
+            "python>=3.10,<3.13",
+            "--name",
+            "demo",
+        ])
+        .unwrap();
+
+        match cli.command {
+            EnvCommand::Install(arguments) => {
+                assert_eq!(
+                    arguments.packages,
+                    vec!["conda-forge::jq", "python>=3.10,<3.13"]
+                );
+                assert_eq!(arguments.name, Some("demo".to_string()));
+                assert_eq!(arguments.prefix, None);
+            }
+            other => panic!("unexpected command parsed: {:?}", other),
+        }
+    }
+
+    #[test]
     fn run_command_parser_preserves_argv_boundaries_after_separator() {
         let cli = TestCli::try_parse_from([
             "enva",

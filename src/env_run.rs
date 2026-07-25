@@ -8,7 +8,9 @@ use crate::backend::{
 use crate::error::{EnvError, Result};
 use crate::package_manager::{PackageManager, PackageManagerDetector};
 use clap::Args;
+use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info};
@@ -142,12 +144,31 @@ fn format_candidates(candidates: &[ResolvedEnvironment]) -> String {
         .join(", ")
 }
 
+fn canonical_environment_candidate_identity(prefix: &Path) -> PathBuf {
+    fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf())
+}
+
+fn dedupe_environment_candidates(candidates: Vec<ResolvedEnvironment>) -> Vec<ResolvedEnvironment> {
+    let mut seen_prefixes: HashSet<PathBuf> = HashSet::new();
+    let mut unique_candidates: Vec<ResolvedEnvironment> = Vec::new();
+
+    for candidate in candidates {
+        let identity: PathBuf = canonical_environment_candidate_identity(&candidate.prefix);
+        if seen_prefixes.insert(identity) {
+            unique_candidates.push(candidate);
+        }
+    }
+
+    unique_candidates
+}
+
 fn require_unique_environment(
     env_name: &str,
     candidates: Vec<ResolvedEnvironment>,
     not_found_message: String,
 ) -> Result<ResolvedEnvironment> {
-    match EnvironmentResolution::from_candidates(candidates) {
+    let unique_candidates: Vec<ResolvedEnvironment> = dedupe_environment_candidates(candidates);
+    match EnvironmentResolution::from_candidates(unique_candidates) {
         EnvironmentResolution::NotFound => Err(EnvError::Execution(not_found_message)),
         EnvironmentResolution::Unique(environment) => Ok(environment),
         EnvironmentResolution::Ambiguous(environments) => Err(EnvError::Execution(format!(
@@ -551,6 +572,42 @@ mod tests {
         assert!(message.contains("/first/envs/demo"));
         assert!(message.contains("/second/envs/demo"));
         assert!(message.contains("Use --prefix to disambiguate"));
+    }
+
+    #[test]
+    fn require_unique_environment_collapses_same_physical_prefix() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let prefix: PathBuf = temporary_directory.path().join("envs").join("demo");
+        fs::create_dir_all(&prefix).unwrap();
+        let first_backend: Arc<dyn crate::backend::EnvironmentBackend> = Arc::new(
+            crate::backend::cli::CliBackend::new(Some(PackageManager::Micromamba)),
+        );
+        let second_backend: Arc<dyn crate::backend::EnvironmentBackend> = Arc::new(
+            crate::backend::cli::CliBackend::new(Some(PackageManager::Conda)),
+        );
+        let candidates: Vec<ResolvedEnvironment> = vec![
+            ResolvedEnvironment {
+                backend: first_backend,
+                backend_kind: BackendKind::Cli,
+                package_manager: Some(PackageManager::Micromamba),
+                prefix: prefix.clone(),
+                requested_name: Some("demo".to_string()),
+            },
+            ResolvedEnvironment {
+                backend: second_backend,
+                backend_kind: BackendKind::Cli,
+                package_manager: Some(PackageManager::Conda),
+                prefix: prefix.clone(),
+                requested_name: Some("demo".to_string()),
+            },
+        ];
+
+        let resolved: ResolvedEnvironment =
+            require_unique_environment("demo", candidates, "not found".to_string())
+                .expect("the same physical prefix must resolve uniquely");
+
+        assert_eq!(resolved.prefix, prefix);
+        assert_eq!(resolved.package_manager, Some(PackageManager::Micromamba));
     }
 
     #[test]

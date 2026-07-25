@@ -23,19 +23,22 @@ jobs:
             yaml: src/configs/otter-core.yaml
             env_name: otter-core-ci
             probe: "samtools --version | head -n 1"
-            install_specs: "conda-forge::jq,bioconda::seqtk"
+            install_spec_primary: "conda-forge::jq"
+            install_spec_secondary: "bioconda::seqtk"
             install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
           - label: otter-snakemake
             yaml: src/configs/otter-snakemake.yaml
             env_name: otter-snakemake-ci
             probe: "snakemake --version"
-            install_specs: "conda-forge::jq,bioconda::seqtk"
+            install_spec_primary: "conda-forge::jq"
+            install_spec_secondary: "bioconda::seqtk"
             install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
           - label: otter-extra
             yaml: src/configs/otter-extra.yaml
             env_name: otter-extra-ci
             probe: "bedtools --version"
-            install_specs: "conda-forge::jq,bioconda::seqtk"
+            install_spec_primary: "conda-forge::jq"
+            install_spec_secondary: "bioconda::seqtk"
             install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
     env:
       CARGO_TERM_COLOR: always
@@ -98,7 +101,9 @@ jobs:
         run: |
           set -euo pipefail
           export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
-          ./target/release/enva install --name "${{ matrix.env_name }}" "${{ matrix.install_specs }}" \
+          ./target/release/enva install --name "${{ matrix.env_name }}" \
+            "${{ matrix.install_spec_primary }}" \
+            "${{ matrix.install_spec_secondary }}" \
             2>&1 | tee "ci-logs/${{ matrix.label }}-install.log"
 
       - name: Run smoke command inside environment
@@ -312,7 +317,8 @@ jobs:
         run: |
           set -euo pipefail
           export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
-          ./target/release/enva install --name enva-adopt-ci "conda-forge::jq,bioconda::seqtk" \
+          ./target/release/enva install --name enva-adopt-ci \
+            conda-forge::jq bioconda::seqtk \
             2>&1 | tee "ci-logs/adopt-install.log"
 
       - name: Run smoke commands inside adopted environment

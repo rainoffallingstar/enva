@@ -59,9 +59,8 @@ pub struct PrefixCloneResult {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct PrefixRelocationResult {
-    pub files_rewritten: u64,
-    pub bytes_rewritten: u64,
+pub struct PrefixPublicationValidationResult {
+    pub files_scanned: u64,
     pub symlinks_rewritten: u64,
 }
 
@@ -313,23 +312,23 @@ fn replace_all_bytes(input: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     output
 }
 
-fn sweep_relocation_entries(
+fn validate_publication_entries(
     root: &Path,
     staging_prefix: &[u8],
     final_prefix: &[u8],
-    result: &mut PrefixRelocationResult,
+    result: &mut PrefixPublicationValidationResult,
 ) -> Result<()> {
     for entry in fs::read_dir(root)
-        .map_err(|error| io_error("Failed to read relocation directory", root, error))?
+        .map_err(|error| io_error("Failed to read publication directory", root, error))?
     {
         let entry =
-            entry.map_err(|error| io_error("Failed to read relocation entry", root, error))?;
+            entry.map_err(|error| io_error("Failed to read publication entry", root, error))?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| io_error("Failed to inspect relocation entry", &path, error))?;
+            .map_err(|error| io_error("Failed to inspect publication entry", &path, error))?;
         if metadata.file_type().is_symlink() {
             let target = fs::read_link(&path)
-                .map_err(|error| io_error("Failed to read relocation symlink", &path, error))?;
+                .map_err(|error| io_error("Failed to read publication symlink", &path, error))?;
             let target_bytes = path_bytes(&target);
             if target_bytes
                 .windows(staging_prefix.len())
@@ -343,53 +342,47 @@ fn sweep_relocation_entries(
                     ))
                 })?;
                 fs::remove_file(&path).map_err(|error| {
-                    io_error("Failed to replace relocation symlink", &path, error)
+                    io_error("Failed to replace publication symlink", &path, error)
                 })?;
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(replaced_target, &path)
-                    .map_err(|error| io_error("Failed to write relocated symlink", &path, error))?;
+                    .map_err(|error| io_error("Failed to write published symlink", &path, error))?;
                 #[cfg(windows)]
                 return Err(EnvError::Validation(
-                    "Relocation of absolute symlinks is unsupported on Windows".to_string(),
+                    "Publication of absolute symlinks is unsupported on Windows".to_string(),
                 ));
                 result.symlinks_rewritten += 1;
             }
             continue;
         }
         if metadata.is_dir() {
-            sweep_relocation_entries(&path, staging_prefix, final_prefix, result)?;
+            validate_publication_entries(&path, staging_prefix, final_prefix, result)?;
             continue;
         }
         if !metadata.is_file() {
             continue;
         }
+
+        result.files_scanned += 1;
         let content = fs::read(&path)
-            .map_err(|error| io_error("Failed to read relocation file", &path, error))?;
-        if !content
+            .map_err(|error| io_error("Failed to read publication file", &path, error))?;
+        if content
             .windows(staging_prefix.len())
             .any(|window| window == staging_prefix)
         {
-            continue;
-        }
-        if content.contains(&0) || std::str::from_utf8(&content).is_err() {
             return Err(EnvError::Validation(format!(
-                "Binary file contains staging prefix residual: {}",
+                "File contains staging prefix residual after target-prefix installation: {}",
                 path.display()
             )));
         }
-        let replaced = replace_all_bytes(&content, staging_prefix, final_prefix);
-        fs::write(&path, &replaced)
-            .map_err(|error| io_error("Failed to write relocated file", &path, error))?;
-        result.files_rewritten += 1;
-        result.bytes_rewritten += replaced.len() as u64;
     }
     Ok(())
 }
 
-pub fn relocate_cloned_prefix(
+pub fn validate_staged_prefix_for_publication(
     staging_prefix: &Path,
     final_prefix: &Path,
-) -> Result<PrefixRelocationResult> {
+) -> Result<PrefixPublicationValidationResult> {
     let staging_bytes = path_bytes(staging_prefix);
     let final_bytes = path_bytes(final_prefix);
     if staging_bytes.is_empty() {
@@ -397,8 +390,8 @@ pub fn relocate_cloned_prefix(
             "Staging prefix must not be empty".to_string(),
         ));
     }
-    let mut result = PrefixRelocationResult::default();
-    sweep_relocation_entries(staging_prefix, &staging_bytes, &final_bytes, &mut result)?;
+    let mut result = PrefixPublicationValidationResult::default();
+    validate_publication_entries(staging_prefix, &staging_bytes, &final_bytes, &mut result)?;
     Ok(result)
 }
 
@@ -1663,6 +1656,7 @@ impl RattlerBackend {
             .with_package_cache(PackageCache::new(Self::package_cache_dir(&cache_root)))
             .with_installed_packages(installed)
             .with_requested_specs(requested_specs)
+            .with_alternative_target_prefix(prefix)
             .install(&staging_path, solved_records)
             .await
             .map(|_| ())
@@ -1673,7 +1667,9 @@ impl RattlerBackend {
                     error
                 ))
             })
-            .and_then(|()| relocate_cloned_prefix(&staging_path, prefix).map(|_| ()))
+            .and_then(|()| {
+                validate_staged_prefix_for_publication(&staging_path, prefix).map(|_| ())
+            })
             .and_then(|()| staged_prefix.commit());
 
         let result = install_result;
@@ -2009,6 +2005,7 @@ impl EnvironmentBackend for RattlerBackend {
         let install_result = Installer::new()
             .with_package_cache(PackageCache::new(Self::package_cache_dir(&cache_root)))
             .with_requested_specs(requested_specs)
+            .with_alternative_target_prefix(&target_prefix)
             .install(&staging_path, solved_records)
             .await
             .map(|_| ())
@@ -2020,7 +2017,9 @@ impl EnvironmentBackend for RattlerBackend {
                 ))
             })
             .and_then(|()| write_rattler_ownership_record(&staging_path, None).map(|_| ()))
-            .and_then(|()| relocate_cloned_prefix(&staging_path, &target_prefix).map(|_| ()))
+            .and_then(|()| {
+                validate_staged_prefix_for_publication(&staging_path, &target_prefix).map(|_| ())
+            })
             .and_then(|()| staged_prefix.commit());
 
         match install_result {
@@ -2204,7 +2203,8 @@ impl EnvironmentBackend for RattlerBackend {
 #[cfg(test)]
 mod tests {
     use super::{
-        benchmark_prefix_clone, clone_prefix_for_staging, relocate_cloned_prefix, RattlerBackend,
+        benchmark_prefix_clone, clone_prefix_for_staging, validate_staged_prefix_for_publication,
+        RattlerBackend,
     };
     use crate::backend::{
         EnvironmentBackend, EnvironmentTarget, OutputMode, RunCommand, RunRequest,
@@ -2381,7 +2381,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn relocation_rewrites_text_and_absolute_symlinks_and_rejects_binary_residuals() {
+    fn publication_rewrites_absolute_symlinks_and_rejects_all_file_residuals() {
         let _guard = env_lock().lock().unwrap();
         let temporary_directory = tempdir().unwrap();
         let staging = temporary_directory.path().join("staging-prefix");
@@ -2391,37 +2391,44 @@ mod tests {
         fs::create_dir_all(staging.join("bin")).unwrap();
         fs::write(
             staging.join("bin/tool"),
-            format!(
-                "#!{}/bin/python\nprefix={}\n",
-                staging.display(),
-                staging.display()
-            ),
+            b"prefix already patched for final path\n",
         )
         .unwrap();
         std::os::unix::fs::symlink(staging.join("bin/tool"), staging.join("absolute-tool"))
             .unwrap();
 
-        let result = relocate_cloned_prefix(&staging, &final_prefix).unwrap();
-        assert_eq!(result.files_rewritten, 1);
+        let result = validate_staged_prefix_for_publication(&staging, &final_prefix).unwrap();
+        assert_eq!(result.files_scanned, 1);
         assert_eq!(result.symlinks_rewritten, 1);
-        let text = fs::read_to_string(staging.join("bin/tool")).unwrap();
-        assert!(!text.contains(staging.to_string_lossy().as_ref()));
-        assert!(text.contains(final_prefix.to_string_lossy().as_ref()));
         assert_eq!(
             fs::read_link(staging.join("absolute-tool")).unwrap(),
             final_prefix.join("bin/tool")
         );
 
+        let text_staging = temporary_directory.path().join("text-staging");
+        fs::create_dir(&text_staging).unwrap();
+        fs::write(
+            text_staging.join("script"),
+            format!("#!{}/bin/python\n", text_staging.display()),
+        )
+        .unwrap();
+        let text_error =
+            validate_staged_prefix_for_publication(&text_staging, &final_prefix).unwrap_err();
+        assert!(text_error
+            .to_string()
+            .contains("File contains staging prefix residual after target-prefix installation"));
+
         let binary_staging = temporary_directory.path().join("binary-staging");
         fs::create_dir(&binary_staging).unwrap();
-        let mut binary = vec![0_u8, 1, 2];
+        let mut binary: Vec<u8> = vec![0_u8, 1, 2];
         binary.extend_from_slice(binary_staging.to_string_lossy().as_bytes());
         binary.push(0);
         fs::write(binary_staging.join("binary"), binary).unwrap();
-        let error = relocate_cloned_prefix(&binary_staging, &final_prefix).unwrap_err();
-        assert!(error
+        let binary_error =
+            validate_staged_prefix_for_publication(&binary_staging, &final_prefix).unwrap_err();
+        assert!(binary_error
             .to_string()
-            .contains("Binary file contains staging prefix residual"));
+            .contains("File contains staging prefix residual after target-prefix installation"));
     }
 
     #[test]
