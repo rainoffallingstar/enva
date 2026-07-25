@@ -18,9 +18,10 @@ pub use error::{EnvError, Result};
 pub use package_manager::{get_global_detector, PackageManager, PackageManagerDetector};
 
 // Constants for the 3 core environments
-pub const CORE_ENV_NAME: &str = "xdxtools-core";
-pub const SNAKEMAKE_ENV_NAME: &str = "xdxtools-snakemake";
-pub const EXTRA_ENV_NAME: &str = "xdxtools-extra";
+pub const CORE_ENV_NAME: &str = "otter-core";
+pub const SNAKEMAKE_ENV_NAME: &str = "otter-snakemake";
+pub const EXTRA_ENV_NAME: &str = "otter-extra";
+pub const BUILT_IN_ENV_NAMES: [&str; 3] = [CORE_ENV_NAME, SNAKEMAKE_ENV_NAME, EXTRA_ENV_NAME];
 
 /// Initialize enva library.
 ///
@@ -46,6 +47,18 @@ pub fn display_startup_banner() {
 #[cfg(test)]
 mod tests {
     use super::initialize;
+    use super::{BUILT_IN_ENV_NAMES, CORE_ENV_NAME, EXTRA_ENV_NAME, SNAKEMAKE_ENV_NAME};
+
+    #[test]
+    fn built_in_environment_names_use_otter_branding() {
+        assert_eq!(CORE_ENV_NAME, "otter-core");
+        assert_eq!(SNAKEMAKE_ENV_NAME, "otter-snakemake");
+        assert_eq!(EXTRA_ENV_NAME, "otter-extra");
+        assert_eq!(
+            BUILT_IN_ENV_NAMES,
+            [CORE_ENV_NAME, SNAKEMAKE_ENV_NAME, EXTRA_ENV_NAME]
+        );
+    }
 
     #[tokio::test]
     async fn initialize_is_idempotent_without_package_manager_probe() {

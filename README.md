@@ -8,9 +8,9 @@ enva is a standalone, rattler-first environment manager for bioinformatics workf
 - **Compatibility aware**: discovers environments from `conda`, `mamba`, and `micromamba`; canonical aliases are deduplicated, while distinct same-name prefixes require explicit `--prefix` selection
 - **Adoption support**: can adopt an existing external environment into rattler ownership metadata; rattler mutation and removal never adopt implicitly
 - **Three pre-configured environments**:
-  - `xdxtools-core`
-  - `xdxtools-snakemake`
-  - `xdxtools-extra`
+  - `otter-core`
+  - `otter-snakemake`
+  - `otter-extra`
 - **Operational controls**: dry-run validation, JSON output, detailed environment listing, cache cleanup
 
 ## Installation
@@ -45,10 +45,10 @@ cargo build --release
 ./enva create --extra
 
 # Create a custom environment from YAML
-./enva create --yaml ./src/configs/xdxtools-core.yaml --name xdxtools-core
+./enva create --yaml ./src/configs/otter-core.yaml --name otter-core
 
 # Replace an existing environment and clean rattler caches first
-./enva create --yaml ./src/configs/xdxtools-core.yaml --name xdxtools-core --force --clean-cache
+./enva create --yaml ./src/configs/otter-core.yaml --name otter-core --force --clean-cache
 
 # Create and immediately install extra packages
 ./enva create --core --with seqtk --with conda-forge::jq
@@ -74,10 +74,10 @@ cargo build --release
 
 ```bash
 # Recommended syntax
-./enva run xdxtools-core -- fastqc --version
+./enva run otter-core -- fastqc --version
 
 # Equivalent flag-based syntax
-./enva run --name xdxtools-core --command "fastqc --version"
+./enva run --name otter-core --command "fastqc --version"
 
 # Explicit prefix
 ./enva run --prefix /path/to/env -- fastqc --version
@@ -90,11 +90,11 @@ cargo build --release
  eval "$(./enva shell hook bash)"
 
 # After the hook is loaded, these behave like native shell commands
-enva activate xdxtools-core
+enva activate otter-core
 enva deactivate
 
 # Direct one-shot activation still works
- eval "$(./enva activate xdxtools-core)"
+ eval "$(./enva activate otter-core)"
  eval "$(./enva deactivate)"
 ```
 
@@ -103,7 +103,7 @@ enva deactivate
 ./enva shell hook fish | source
 
 # After the hook is loaded
-enva activate xdxtools-core
+enva activate otter-core
 enva deactivate
 ```
 
@@ -112,7 +112,7 @@ enva deactivate
 ./enva shell hook powershell | Invoke-Expression
 
 # After the hook is loaded
-enva activate xdxtools-core
+enva activate otter-core
 enva deactivate
 ```
 
@@ -120,24 +120,24 @@ enva deactivate
 
 ```bash
 # Install multiple packages
-./enva install --name xdxtools-core fastqc multiqc
+./enva install --name otter-core fastqc multiqc
 
 # Version constraints containing commas remain one MatchSpec argument
-./enva install --name xdxtools-core 'numpy>=1.24,<2'
+./enva install --name otter-core 'numpy>=1.24,<2'
 
 # Mixed-channel specs are accepted as separate arguments
-./enva install --name xdxtools-core conda-forge::jq bioconda::seqtk
+./enva install --name otter-core conda-forge::jq bioconda::seqtk
 ```
 
 ### Adopt or remove environments
 
 ```bash
 # Adopt an existing environment by name or prefix
-./enva adopt --name xdxtools-core
+./enva adopt --name otter-core
 ./enva adopt --prefix /path/to/external/env
 
 # Remove one or more uniquely resolved rattler-owned environments
-./enva remove xdxtools-core xdxtools-extra
+./enva remove otter-core otter-extra
 
 # Use an explicit prefix when a name maps to multiple physical environments
 ./enva remove --prefix /path/to/rattler-owned/env
@@ -151,7 +151,7 @@ enva deactivate
 
 ```bash
 ./enva validate --all
-./enva validate --name xdxtools-core
+./enva validate --name otter-core
 ```
 
 ## Compatibility model
@@ -179,7 +179,7 @@ Examples:
 
 ```bash
 # Prefer a specific compatibility package manager when listing/running in CLI mode
-ENVA_PACKAGE_MANAGER=conda ENVA_BACKEND=cli enva run xdxtools-core -- fastqc --version
+ENVA_PACKAGE_MANAGER=conda ENVA_BACKEND=cli enva run otter-core -- fastqc --version
 
 # Use an explicitly installed micromamba outside PATH
 ENVA_MICROMAMBA_PATH=/opt/micromamba/bin/micromamba ENVA_PACKAGE_MANAGER=micromamba ENVA_BACKEND=cli enva list --detailed
@@ -192,7 +192,7 @@ ENVA_BACKEND=cli enva list --detailed
 
 The e2e workflow covers:
 
-- `xdxtools-core`, `xdxtools-snakemake`, and `xdxtools-extra`: create, list, validate, install extra packages, run smoke commands, and remove
+- `otter-core`, `otter-snakemake`, and `otter-extra`: create, list, validate, install extra packages, run smoke commands, and remove
 - Multi-package mixed-source installs through one command, including separate specs like `conda-forge::jq bioconda::seqtk`
 - Adopted `micromamba` environments: adopt into rattler ownership, install extra packages through the compatibility layer, run commands, and remove through the helper package manager
 - Same-name replacement under an active `CONDA_PREFIX`, ensuring the active root prefix is preferred during `create --force`
@@ -210,8 +210,8 @@ The e2e workflow covers:
 cargo build --bin enva-bench
 
 # Benchmark the default rattler-first run path
-cargo run --bin enva-bench -- --env-name xdxtools-core --command "true"
+cargo run --bin enva-bench -- --env-name otter-core --command "true"
 
 # Compare with an explicit compatibility package manager
-cargo run --bin enva-bench -- --env-name xdxtools-core --pm micromamba --compare-native --format json
+cargo run --bin enva-bench -- --env-name otter-core --pm micromamba --compare-native --format json
 ```

@@ -5,6 +5,7 @@ use crate::backend::{BackendCapability, EnvironmentName, EnvironmentTarget, Outp
 use crate::error::{EnvError, Result};
 use crate::micromamba::CondaEnvironment;
 use crate::package_manager::PackageManager;
+use crate::{BUILT_IN_ENV_NAMES, CORE_ENV_NAME, EXTRA_ENV_NAME, SNAKEMAKE_ENV_NAME};
 use clap::{Args, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
@@ -36,15 +37,15 @@ pub struct EnvCreateArgs {
     #[arg(long)]
     pub all: bool,
 
-    /// Create xdxtools-core environment (bioinformatics tools)
+    /// Create otter-core environment (bioinformatics tools)
     #[arg(long)]
     pub core: bool,
 
-    /// Create xdxtools-snakemake environment (workflow engine)
+    /// Create otter-snakemake environment (workflow engine)
     #[arg(long)]
     pub snakemake: bool,
 
-    /// Create xdxtools-extra environment (additional tools)
+    /// Create otter-extra environment (additional tools)
     #[arg(long)]
     pub extra: bool,
 
@@ -362,20 +363,16 @@ async fn execute_env_create(
         }
     } else {
         if args.all {
-            environments_to_create.extend_from_slice(&[
-                "xdxtools-core",
-                "xdxtools-snakemake",
-                "xdxtools-extra",
-            ]);
+            environments_to_create.extend_from_slice(&BUILT_IN_ENV_NAMES);
         } else {
             if args.core {
-                environments_to_create.push("xdxtools-core");
+                environments_to_create.push(CORE_ENV_NAME);
             }
             if args.snakemake {
-                environments_to_create.push("xdxtools-snakemake");
+                environments_to_create.push(SNAKEMAKE_ENV_NAME);
             }
             if args.extra {
-                environments_to_create.push("xdxtools-extra");
+                environments_to_create.push(EXTRA_ENV_NAME);
             }
             if let Some(ref name) = args.name {
                 environments_to_create.push(name.as_str());
@@ -563,7 +560,7 @@ async fn execute_env_validate(
 
     if args.all || args.name.is_none() {
         // Validate all environments by checking if they exist
-        let env_names = vec!["xdxtools-core", "xdxtools-snakemake", "xdxtools-extra"];
+        let env_names = vec!["otter-core", "otter-snakemake", "otter-extra"];
 
         if json {
             use serde_json::{json, Value};
@@ -648,7 +645,7 @@ async fn execute_env_install(args: EnvInstallArgs, verbose: bool) -> Result<()> 
             crate::backend::EnvironmentTarget::Name(env_name.to_string())
         }
         (None, Some(prefix)) => crate::backend::EnvironmentTarget::Prefix(prefix.clone()),
-        (None, None) => crate::backend::EnvironmentTarget::Name("xdxtools-core".to_string()),
+        (None, None) => crate::backend::EnvironmentTarget::Name("otter-core".to_string()),
         (Some(_), Some(_)) => {
             return Err(EnvError::Validation(
                 "Must specify at most one of --name or --prefix".to_string(),

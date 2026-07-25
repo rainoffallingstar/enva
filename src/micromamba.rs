@@ -11,6 +11,7 @@ use crate::backend::{
 use crate::error::{EnvError, Result};
 use crate::ownership::ownership_record_path;
 use crate::package_manager::{PackageManager, PackageManagerDetector};
+use crate::{BUILT_IN_ENV_NAMES, CORE_ENV_NAME, EXTRA_ENV_NAME, SNAKEMAKE_ENV_NAME};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -86,59 +87,59 @@ fn resolve_micromamba_path(
 
 /// Tool to environment mapping (updated for micromamba)
 pub const TOOL_ENVIRONMENT_MAP: &[(&str, &str)] = &[
-    // QC Tools -> xdxtools-core
-    ("fastqc", "xdxtools-core"),
-    ("multiqc", "xdxtools-core"),
-    ("seqkit", "xdxtools-core"),
-    ("seqtk", "xdxtools-core"),
-    ("samtools", "xdxtools-core"),
-    ("picard", "xdxtools-core"),
-    // Methylation Tools -> xdxtools-core
-    ("bismark", "xdxtools-core"),
-    ("trim_galore", "xdxtools-core"),
-    ("trim-galore", "xdxtools-core"),
-    // RNA-seq Tools -> xdxtools-core
-    ("star", "xdxtools-core"),
-    ("htseq-count", "xdxtools-core"),
-    ("htseq", "xdxtools-core"),
-    ("rmats", "xdxtools-core"),
-    // ChIP-seq/ATAC-seq Core Tools -> xdxtools-core
-    ("macs2", "xdxtools-core"),
-    ("bwa", "xdxtools-core"),
-    ("bowtie2", "xdxtools-core"),
-    ("bwa-index", "xdxtools-core"),     // BWA index building
-    ("bowtie2-build", "xdxtools-core"), // Bowtie2 index building
-    // Qualimap -> xdxtools-core
-    ("qualimap", "xdxtools-core"),
-    // Snakemake -> xdxtools-snakemake
-    ("snakemake", "xdxtools-snakemake"),
-    ("jinja2", "xdxtools-snakemake"),
-    ("click", "xdxtools-snakemake"),
-    ("git", "xdxtools-snakemake"),
-    // Advanced Bioinformatics -> xdxtools-extra
-    ("bedtools", "xdxtools-extra"),
-    ("bcftools", "xdxtools-extra"),
-    ("vcftools", "xdxtools-extra"),
-    ("tabix", "xdxtools-extra"),
-    // Advanced ChIP-seq/ATAC-seq Tools -> xdxtools-extra
-    ("deepTools", "xdxtools-extra"),
-    ("genrich", "xdxtools-extra"),
-    ("homer", "xdxtools-extra"),
-    // Data Science & Visualization -> xdxtools-extra
-    ("jupyter", "xdxtools-extra"),
-    ("jupyterlab", "xdxtools-extra"),
-    ("flask", "xdxtools-extra"),
-    ("dash", "xdxtools-extra"),
-    ("streamlit", "xdxtools-extra"),
-    ("scikit-learn", "xdxtools-extra"),
-    ("scipy", "xdxtools-extra"),
-    ("statsmodels", "xdxtools-extra"),
-    // Development Toolchain -> xdxtools-extra
-    ("go", "xdxtools-extra"),
-    ("gofmt", "xdxtools-extra"),
-    ("rust", "xdxtools-extra"),
-    ("rustc", "xdxtools-extra"),
-    ("cargo", "xdxtools-extra"),
+    // QC Tools -> otter-core
+    ("fastqc", CORE_ENV_NAME),
+    ("multiqc", CORE_ENV_NAME),
+    ("seqkit", CORE_ENV_NAME),
+    ("seqtk", CORE_ENV_NAME),
+    ("samtools", CORE_ENV_NAME),
+    ("picard", CORE_ENV_NAME),
+    // Methylation Tools -> otter-core
+    ("bismark", CORE_ENV_NAME),
+    ("trim_galore", CORE_ENV_NAME),
+    ("trim-galore", CORE_ENV_NAME),
+    // RNA-seq Tools -> otter-core
+    ("star", CORE_ENV_NAME),
+    ("htseq-count", CORE_ENV_NAME),
+    ("htseq", CORE_ENV_NAME),
+    ("rmats", CORE_ENV_NAME),
+    // ChIP-seq/ATAC-seq Core Tools -> otter-core
+    ("macs2", CORE_ENV_NAME),
+    ("bwa", CORE_ENV_NAME),
+    ("bowtie2", CORE_ENV_NAME),
+    ("bwa-index", CORE_ENV_NAME),     // BWA index building
+    ("bowtie2-build", CORE_ENV_NAME), // Bowtie2 index building
+    // Qualimap -> otter-core
+    ("qualimap", CORE_ENV_NAME),
+    // Snakemake -> otter-snakemake
+    ("snakemake", SNAKEMAKE_ENV_NAME),
+    ("jinja2", SNAKEMAKE_ENV_NAME),
+    ("click", SNAKEMAKE_ENV_NAME),
+    ("git", SNAKEMAKE_ENV_NAME),
+    // Advanced Bioinformatics -> otter-extra
+    ("bedtools", EXTRA_ENV_NAME),
+    ("bcftools", EXTRA_ENV_NAME),
+    ("vcftools", EXTRA_ENV_NAME),
+    ("tabix", EXTRA_ENV_NAME),
+    // Advanced ChIP-seq/ATAC-seq Tools -> otter-extra
+    ("deepTools", EXTRA_ENV_NAME),
+    ("genrich", EXTRA_ENV_NAME),
+    ("homer", EXTRA_ENV_NAME),
+    // Data Science & Visualization -> otter-extra
+    ("jupyter", EXTRA_ENV_NAME),
+    ("jupyterlab", EXTRA_ENV_NAME),
+    ("flask", EXTRA_ENV_NAME),
+    ("dash", EXTRA_ENV_NAME),
+    ("streamlit", EXTRA_ENV_NAME),
+    ("scikit-learn", EXTRA_ENV_NAME),
+    ("scipy", EXTRA_ENV_NAME),
+    ("statsmodels", EXTRA_ENV_NAME),
+    // Development Toolchain -> otter-extra
+    ("go", EXTRA_ENV_NAME),
+    ("gofmt", EXTRA_ENV_NAME),
+    ("rust", EXTRA_ENV_NAME),
+    ("rustc", EXTRA_ENV_NAME),
+    ("cargo", EXTRA_ENV_NAME),
 ];
 
 /// Micromamba environment configuration
@@ -599,14 +600,12 @@ impl MicromambaManager {
         self.auto_copy_config_templates(verbose).await?;
 
         // Load environment configurations
-        let env_names = ["xdxtools-core", "xdxtools-snakemake", "xdxtools-extra"];
+        for environment_name in BUILT_IN_ENV_NAMES {
+            let environment_file = self.config_dir.join(format!("{}.yaml", environment_name));
 
-        for env_name in &env_names {
-            let env_file = self.config_dir.join(format!("{}.yaml", env_name));
-
-            if !env_file.exists() {
+            if !environment_file.exists() {
                 if verbose {
-                    warn!("Environment file not found: {:?}", env_file);
+                    warn!("Environment file not found: {:?}", environment_file);
                 }
                 continue;
             }
@@ -614,9 +613,9 @@ impl MicromambaManager {
             // Get tools for this environment
             let tools = TOOL_ENVIRONMENT_MAP
                 .iter()
-                .filter_map(|(tool, env)| {
-                    if env == env_name {
-                        Some(tool.to_string())
+                .filter_map(|(tool_name, mapped_environment_name)| {
+                    if *mapped_environment_name == environment_name {
+                        Some((*tool_name).to_string())
                     } else {
                         None
                     }
@@ -624,7 +623,7 @@ impl MicromambaManager {
                 .collect::<Vec<String>>();
 
             // Check if environment exists
-            let status = match self.environment_exists(env_name).await {
+            let status = match self.environment_exists(environment_name).await {
                 Ok(exists) => {
                     if exists {
                         EnvironmentStatus::Installed
@@ -632,18 +631,19 @@ impl MicromambaManager {
                         EnvironmentStatus::NotInstalled
                     }
                 }
-                Err(e) => EnvironmentStatus::Error(e.to_string()),
+                Err(error) => EnvironmentStatus::Error(error.to_string()),
             };
 
             let environment = MicromambaEnvironment {
-                name: env_name.to_string(),
-                file_path: env_file,
+                name: environment_name.to_string(),
+                file_path: environment_file,
                 tools,
                 status,
                 created_at: None,
             };
 
-            self.environments.insert(env_name.to_string(), environment);
+            self.environments
+                .insert(environment_name.to_string(), environment);
         }
 
         if verbose {
@@ -658,43 +658,34 @@ impl MicromambaManager {
             .join("src")
             .join("configs");
 
-        // Check if configuration directory exists and has files
-        if self.config_dir.exists() {
-            let yaml_count = fs::read_dir(&self.config_dir)
-                .map_err(|e| EnvError::FileOperation(format!("Failed to read config dir: {}", e)))?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_name().to_string_lossy().ends_with(".yaml"))
-                .count();
-
-            if yaml_count >= 3 {
-                if verbose {
-                    debug!("Configuration templates already exist, skipping copy");
-                }
-                return Ok(());
+        let templates_are_present = BUILT_IN_ENV_NAMES.iter().all(|environment_name| {
+            self.config_dir
+                .join(format!("{}.yaml", environment_name))
+                .exists()
+        });
+        if templates_are_present {
+            if verbose {
+                debug!("Configuration templates already exist, skipping copy");
             }
+            return Ok(());
         }
 
         if verbose {
             info!("Auto-copying environment configuration templates...");
         }
 
-        // Create config directory if it doesn't exist
-        fs::create_dir_all(&self.config_dir)
-            .map_err(|e| EnvError::FileOperation(format!("Failed to create config dir: {}", e)))?;
+        fs::create_dir_all(&self.config_dir).map_err(|error| {
+            EnvError::FileOperation(format!("Failed to create config dir: {}", error))
+        })?;
 
-        // Copy all YAML files
-        let files = [
-            "xdxtools-core.yaml",
-            "xdxtools-snakemake.yaml",
-            "xdxtools-extra.yaml",
-        ];
-        for file_name in &files {
-            let source_file = source_config_dir.join(file_name);
-            let target_file = self.config_dir.join(file_name);
+        for environment_name in BUILT_IN_ENV_NAMES {
+            let file_name = format!("{}.yaml", environment_name);
+            let source_file = source_config_dir.join(&file_name);
+            let target_file = self.config_dir.join(&file_name);
 
             if source_file.exists() && !target_file.exists() {
-                fs::copy(&source_file, &target_file).map_err(|e| {
-                    EnvError::FileOperation(format!("Failed to copy {}: {}", file_name, e))
+                fs::copy(&source_file, &target_file).map_err(|error| {
+                    EnvError::FileOperation(format!("Failed to copy {}: {}", file_name, error))
                 })?;
                 if verbose {
                     info!("✓ Copied configuration template: {}", file_name);
@@ -1566,9 +1557,9 @@ impl MicromambaManager {
     /// Generate environment file content (for compatibility with CondaManager API)
     pub fn generate_environment_file(&self, env_name: &str) -> Result<String> {
         match env_name {
-            "xdxtools-core" => Ok(self.generate_xdxtools_core_yaml()),
-            "xdxtools-snakemake" => Ok(self.generate_xdxtools_snakemake_yaml()),
-            "xdxtools-extra" => Ok(self.generate_xdxtools_extra_yaml()),
+            CORE_ENV_NAME => Ok(self.generate_otter_core_yaml()),
+            SNAKEMAKE_ENV_NAME => Ok(self.generate_otter_snakemake_yaml()),
+            EXTRA_ENV_NAME => Ok(self.generate_otter_extra_yaml()),
             _ => Err(EnvError::Validation(format!(
                 "Unknown environment: {}",
                 env_name
@@ -1576,9 +1567,9 @@ impl MicromambaManager {
         }
     }
 
-    /// Generate xdxtools-core environment YAML content
-    fn generate_xdxtools_core_yaml(&self) -> String {
-        r#"name: xdxtools-core
+    /// Generate otter-core environment YAML content
+    fn generate_otter_core_yaml(&self) -> String {
+        r#"name: otter-core
 channels:
   - conda-forge
   - bioconda
@@ -1607,9 +1598,9 @@ dependencies:
         .to_string()
     }
 
-    /// Generate xdxtools-snakemake environment YAML content
-    fn generate_xdxtools_snakemake_yaml(&self) -> String {
-        r#"name: xdxtools-snakemake
+    /// Generate otter-snakemake environment YAML content
+    fn generate_otter_snakemake_yaml(&self) -> String {
+        r#"name: otter-snakemake
 channels:
   - conda-forge
   - bioconda
@@ -1632,9 +1623,9 @@ dependencies:
         .to_string()
     }
 
-    /// Generate xdxtools-extra environment YAML content
-    fn generate_xdxtools_extra_yaml(&self) -> String {
-        r#"name: xdxtools-extra
+    /// Generate otter-extra environment YAML content
+    fn generate_otter_extra_yaml(&self) -> String {
+        r#"name: otter-extra
 channels:
   - conda-forge
   - bioconda
@@ -1792,9 +1783,9 @@ dependencies:
         let envs = manager.list_environments().await.unwrap();
 
         assert_eq!(envs.len(), 3);
-        assert!(envs.iter().any(|env| env.name == "xdxtools-core"));
-        assert!(envs.iter().any(|env| env.name == "xdxtools-snakemake"));
-        assert!(envs.iter().any(|env| env.name == "xdxtools-extra"));
+        assert!(envs.iter().any(|env| env.name == CORE_ENV_NAME));
+        assert!(envs.iter().any(|env| env.name == SNAKEMAKE_ENV_NAME));
+        assert!(envs.iter().any(|env| env.name == EXTRA_ENV_NAME));
     }
 
     #[test]

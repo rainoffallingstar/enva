@@ -112,9 +112,9 @@ The heart of the application - handles all micromamba operations:
 - `TOOL_ENVIRONMENT_MAP` - Maps tools to their default environments
 
 **3 Pre-configured Environments:**
-1. `xdxtools-core` - Core bioinformatics tools (FastQC, MultiQC, Bismark, STAR, BWA, Qualimap, etc.)
-2. `xdxtools-snakemake` - Workflow engine and dependencies
-3. `xdxtools-extra` - Advanced visualization and analysis tools
+1. `otter-core` - Core bioinformatics tools (FastQC, MultiQC, Bismark, STAR, BWA, Qualimap, etc.)
+2. `otter-snakemake` - Workflow engine and dependencies
+3. `otter-extra` - Advanced visualization and analysis tools
 
 #### 2. **env.rs** (752 lines)
 Environment command handlers and CLI argument structures:
@@ -141,9 +141,9 @@ Error handling:
 ### Configuration System
 
 YAML configuration files in `src/configs/`:
-- `xdxtools-core.yaml` - Core bioinformatics tools
-- `xdxtools-snakemake.yaml` - Workflow engine
-- `xdxtools-extra.yaml` - Additional tools
+- `otter-core.yaml` - Core bioinformatics tools
+- `otter-snakemake.yaml` - Workflow engine
+- `otter-extra.yaml` - Additional tools
 
 Each config defines:
 - Environment name
@@ -169,12 +169,12 @@ CLI Args → main.rs → env.rs → micromamba.rs → MicromambaManager
    - MicromambaManager creates environment
 
 2. **Run Command:**
-   - User runs `enva run --name xdxtools-core --command "fastqc --version"`
+   - User runs `enva run --name otter-core --command "fastqc --version"`
    - `env_run.rs` executes command in environment
    - Uses micromamba run command
 
 3. **Install Packages:**
-   - User runs `enva install --name xdxtools-core --packages "fastqc,multiqc"`
+   - User runs `enva install --name otter-core --packages "fastqc,multiqc"`
    - Installs packages into specified environment
 
 ## Key Dependencies
@@ -192,9 +192,9 @@ CLI Args → main.rs → env.rs → micromamba.rs → MicromambaManager
 
 Defined in `src/lib.rs`:
 ```rust
-pub const CORE_ENV_NAME: &str = "xdxtools-core";
-pub const SNAKEMAKE_ENV_NAME: &str = "xdxtools-snakemake";
-pub const EXTRA_ENV_NAME: &str = "xdxtools-extra";
+pub const CORE_ENV_NAME: &str = "otter-core";
+pub const SNAKEMAKE_ENV_NAME: &str = "otter-snakemake";
+pub const EXTRA_ENV_NAME: &str = "otter-extra";
 ```
 
 ## Development Patterns
@@ -217,10 +217,10 @@ pub const EXTRA_ENV_NAME: &str = "xdxtools-extra";
 ### Tool Mapping
 `TOOL_ENVIRONMENT_MAP` in micromamba.rs defines which tools belong to which environment:
 ```rust
-("fastqc", "xdxtools-core"),
-("qualimap", "xdxtools-core"),
-("snakemake", "xdxtools-snakemake"),
-("bedtools", "xdxtools-extra"),
+("fastqc", "otter-core"),
+("qualimap", "otter-core"),
+("snakemake", "otter-snakemake"),
+("bedtools", "otter-extra"),
 ```
 
 ## Common Development Tasks

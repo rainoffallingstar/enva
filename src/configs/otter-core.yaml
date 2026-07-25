@@ -1,4 +1,4 @@
-name: xdxtools-core
+name: otter-core
 channels:
   - conda-forge
   - bioconda

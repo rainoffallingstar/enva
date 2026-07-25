@@ -1,4 +1,4 @@
-name: xdxtools-snakemake
+name: otter-snakemake
 channels:
   - conda-forge
   - bioconda

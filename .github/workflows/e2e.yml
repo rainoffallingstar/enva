@@ -19,21 +19,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: xdxtools-core
-            yaml: src/configs/xdxtools-core.yaml
-            env_name: xdxtools-core-ci
+          - label: otter-core
+            yaml: src/configs/otter-core.yaml
+            env_name: otter-core-ci
             probe: "samtools --version | head -n 1"
             install_specs: "conda-forge::jq,bioconda::seqtk"
             install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
-          - label: xdxtools-snakemake
-            yaml: src/configs/xdxtools-snakemake.yaml
-            env_name: xdxtools-snakemake-ci
+          - label: otter-snakemake
+            yaml: src/configs/otter-snakemake.yaml
+            env_name: otter-snakemake-ci
             probe: "snakemake --version"
             install_specs: "conda-forge::jq,bioconda::seqtk"
             install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
-          - label: xdxtools-extra
-            yaml: src/configs/xdxtools-extra.yaml
-            env_name: xdxtools-extra-ci
+          - label: otter-extra
+            yaml: src/configs/otter-extra.yaml
+            env_name: otter-extra-ci
             probe: "bedtools --version"
             install_specs: "conda-forge::jq,bioconda::seqtk"
             install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'

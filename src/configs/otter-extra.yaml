@@ -1,4 +1,4 @@
-name: xdxtools-extra
+name: otter-extra
 channels:
   - conda-forge
   - bioconda
