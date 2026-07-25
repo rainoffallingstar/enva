@@ -4,20 +4,21 @@
 //! type as a compatibility layer for `micromamba` / `mamba` / `conda` discovery,
 //! adoption, and explicit fallback flows.
 
-use crate::backend::OutputMode;
+use crate::backend::{
+    append_environment_run_command, append_environment_shell_arguments, EnvironmentName,
+    OutputMode, RunCommand,
+};
 use crate::error::{EnvError, Result};
 use crate::ownership::ownership_record_path;
 use crate::package_manager::{PackageManager, PackageManagerDetector};
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::process::Command as AsyncCommand;
@@ -35,6 +36,53 @@ static GLOBAL_INITIALIZED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(f
 /// Shared runtime managers for fast env resolution paths
 static RUNTIME_MANAGER_CACHE: LazyLock<StdMutex<HashMap<PackageManager, MicromambaManager>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn validate_micromamba_executable(path: &Path) -> Result<PathBuf> {
+    let canonical_path = normalize_and_validate_path(path)?;
+    let output = Command::new(&canonical_path)
+        .arg("--version")
+        .output()
+        .map_err(|error| {
+            EnvError::Execution(format!(
+                "Failed to execute micromamba at {}: {}",
+                canonical_path.display(),
+                error
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(EnvError::Execution(format!(
+            "Micromamba at {} failed its version check with status {:?}: {}",
+            canonical_path.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(canonical_path)
+}
+
+fn resolve_micromamba_path(
+    explicitly_configured_path: Option<PathBuf>,
+    path_discovery_result: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(configured_path) = explicitly_configured_path {
+        return validate_micromamba_executable(&configured_path).map_err(|error| {
+            EnvError::Config(format!(
+                "ENVA_MICROMAMBA_PATH={} is not a usable micromamba executable: {}",
+                configured_path.display(),
+                error
+            ))
+        });
+    }
+
+    if let Some(discovered_path) = path_discovery_result {
+        return validate_micromamba_executable(&discovered_path);
+    }
+
+    Err(EnvError::Config(
+        "micromamba is an optional compatibility backend and is not installed; install it explicitly and add it to PATH, or set ENVA_MICROMAMBA_PATH"
+            .to_string(),
+    ))
+}
 
 /// Tool to environment mapping (updated for micromamba)
 pub const TOOL_ENVIRONMENT_MAP: &[(&str, &str)] = &[
@@ -253,7 +301,7 @@ impl MicromambaManager {
         let pm_path = match pm_type {
             PackageManager::Conda | PackageManager::Mamba => which(pm_type.command())
                 .map_err(|_| EnvError::Config(format!("{} not found in PATH", pm_type)))?,
-            PackageManager::Micromamba => Self::find_or_install_micromamba().await?,
+            PackageManager::Micromamba => Self::find_micromamba()?,
             PackageManager::None => {
                 return Err(EnvError::Config(
                     "No package manager found (conda/mamba/micromamba)".to_string(),
@@ -356,7 +404,7 @@ impl MicromambaManager {
 
     /// Create micromamba manager with custom config directory
     pub async fn with_config_dir<P: AsRef<Path>>(config_dir: P) -> Result<Self> {
-        let pm_path = Self::find_or_install_micromamba().await?;
+        let pm_path = Self::find_micromamba()?;
         let config_dir = config_dir.as_ref().to_path_buf();
 
         let mut manager = Self {
@@ -378,7 +426,7 @@ impl MicromambaManager {
         config_dir: P,
         version_config: VersionConfig,
     ) -> Result<Self> {
-        let pm_path = Self::find_or_install_micromamba().await?;
+        let pm_path = Self::find_micromamba()?;
         let config_dir = config_dir.as_ref().to_path_buf();
 
         let mut manager = Self {
@@ -536,412 +584,13 @@ impl MicromambaManager {
         }
     }
 
-    /// Determine installation directory for micromamba
-    fn determine_install_directory() -> Result<PathBuf> {
-        // Priority order:
-        // 1. MICROMAMBA_INSTALL_DIR environment variable
-        // 2. XDG_DATA_HOME/micromamba
-        // 3. ~/.local/share/micromamba
-        // 4. Relative to executable directory
-
-        if let Ok(custom_dir) = std::env::var("MICROMAMBA_INSTALL_DIR") {
-            return Ok(PathBuf::from(custom_dir).join("micromamba"));
-        }
-
-        if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
-            return Ok(PathBuf::from(data_home)
-                .join("micromamba")
-                .join("micromamba"));
-        }
-
-        if let Some(home) = dirs::home_dir() {
-            return Ok(home
-                .join(".local")
-                .join("share")
-                .join("micromamba")
-                .join("micromamba"));
-        }
-
-        // Fallback to executable directory
-        if let Ok(current_exe) = std::env::current_exe() {
-            if let Some(exe_dir) = current_exe.parent() {
-                let canonical_dir = exe_dir.canonicalize().map_err(|e| {
-                    EnvError::FileOperation(format!("Failed to canonicalize exe dir: {}", e))
-                })?;
-                return Ok(canonical_dir.join("micromamba"));
-            }
-        }
-
-        Err(EnvError::FileOperation(
-            "Could not determine installation directory for micromamba".to_string(),
-        ))
-    }
-
-    /// Find or install micromamba executable
-    pub async fn find_or_install_micromamba() -> Result<PathBuf> {
-        // First, check if micromamba is already in PATH
-        if let Ok(path) = which("micromamba") {
-            info!("Found micromamba in PATH: {:?}", path);
-            return normalize_and_validate_path(&path);
-        }
-
-        // Check common installation locations
-        let common_paths = vec![
-            "/usr/local/bin/micromamba",
-            "/opt/micromamba/bin/micromamba",
-            "/usr/bin/micromamba",
-        ];
-
-        for path in &common_paths {
-            let path_buf = PathBuf::from(path);
-            if path_buf.exists() {
-                info!("Found micromamba at common location: {}", path);
-                return normalize_and_validate_path(&path_buf);
-            }
-        }
-
-        // If not found, install it
-        info!("Micromamba not found, installing...");
-        let install_path = Self::install_micromamba().await?;
-        info!("Micromamba installed successfully at: {:?}", install_path);
-
-        Ok(install_path)
-    }
-
-    /// Install micromamba automatically
-    async fn install_micromamba() -> Result<PathBuf> {
-        // Determine target architecture
-        let arch = std::env::consts::ARCH;
-        let _target = match arch {
-            "x86_64" => "x64",
-            "aarch64" => "aarch64",
-            _ => {
-                return Err(EnvError::Validation(format!(
-                    "Unsupported architecture: {}. Supported: x86_64, aarch64",
-                    arch
-                )));
-            }
-        };
-
-        // Determine OS
-        let os = std::env::consts::OS;
-        let platform = match os {
-            "linux" => "linux-64",
-            "macos" => {
-                // Check if Intel or Apple Silicon
-                if arch == "aarch64" {
-                    "osx-arm64"
-                } else {
-                    "osx-64"
-                }
-            }
-            "windows" => "win-64",
-            _ => {
-                return Err(EnvError::Validation(format!(
-                    "Unsupported OS: {}. Supported: linux, macos, windows",
-                    os
-                )));
-            }
-        };
-
-        // Build download URLs (try multiple sources)
-        let primary_url = format!("https://micro.mamba.pm/api/micromamba/{}/latest", platform);
-        let github_url = format!(
-            "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-{}-{}",
-            match os {
-                "linux" => "linux",
-                "macos" => "osx",
-                "windows" => "win",
-                _ => "unknown",
-            },
-            match arch {
-                "x86_64" => "64",
-                "aarch64" => "arm64",
-                _ => "unknown",
-            }
-        );
-
-        let download_urls = vec![
-            ("Official Micromamba", primary_url),
-            ("GitHub Releases", github_url),
-        ];
-
-        // Determine installation directory
-        let install_dir = Self::determine_install_directory()?;
-
-        // Ensure install_dir is absolute
-        let install_dir = if install_dir.is_absolute() {
-            install_dir
-        } else {
-            std::env::current_dir()
-                .map_err(|e| {
-                    EnvError::FileOperation(format!("Failed to get current directory: {}", e))
-                })?
-                .join(&install_dir)
-        };
-
-        let binary_path = install_dir.clone();
-
-        // Skip download if already installed
-        if !binary_path.exists() {
-            // Create installation directory if it doesn't exist
-            fs::create_dir_all(&install_dir).map_err(|e| {
-                EnvError::FileOperation(format!("Failed to create installation directory: {}", e))
-            })?;
-
-            // Try downloading from multiple sources
-            let mut last_error = None;
-
-            // Configure HTTP client with proper redirect handling and User-Agent
-            let client = reqwest::blocking::Client::builder()
-                .redirect(reqwest::redirect::Policy::limited(10)) // Follow up to 10 redirects
-                .user_agent("xdxtools/0.1.0 (compatible; Mozilla/5.0)") // Browser-like User-Agent
-                .timeout(Duration::from_secs(300)) // 5 minute timeout for large downloads
-                .build()
-                .map_err(|e| EnvError::Network(format!("Failed to create HTTP client: {}", e)))?;
-
-            for (source_name, url) in &download_urls {
-                info!("Attempting to download micromamba from: {}", source_name);
-
-                // Download with progress bar
-                let pb = ProgressBar::new(0);
-                let style = ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{elapsed_precise}] [{wide_msg}]")
-                    .map_err(|e| {
-                        EnvError::Template(format!("Failed to create progress bar: {}", e))
-                    })?;
-                let style = style.tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
-                pb.set_style(style);
-                pb.set_message(format!("Downloading micromamba from {}...", source_name));
-
-                match client.get(url).send() {
-                    Ok(response) => {
-                        if !response.status().is_success() {
-                            let error_msg = format!("HTTP {}", response.status());
-                            warn!("Failed to download from {}: {}", source_name, error_msg);
-                            last_error = Some(format!("{}: {}", source_name, error_msg));
-                            continue;
-                        }
-
-                        match response.content_length() {
-                            Some(size) => {
-                                pb.set_length(size);
-                            }
-                            None => {
-                                warn!("Could not determine content length from {}", source_name);
-                            }
-                        };
-
-                        match response.bytes() {
-                            Ok(bytes) => {
-                                // Check if the downloaded content is HTML (indicating an error page)
-                                if bytes.starts_with(b"<!DOCTYPE html")
-                                    || bytes.starts_with(b"<html")
-                                {
-                                    warn!(
-                                        "Downloaded file from {} appears to be HTML (error page)",
-                                        source_name
-                                    );
-                                    last_error = Some(format!(
-                                        "{}: Received HTML instead of binary",
-                                        source_name
-                                    ));
-                                    continue;
-                                }
-
-                                // Check if it's a tar.bz2 archive (from official source)
-                                let is_tar_bz2 = bytes.starts_with(&[0x42, 0x5a, 0x68]); // "BZh" magic bytes
-
-                                if is_tar_bz2 {
-                                    // Write to temporary file for extraction
-                                    let temp_file = install_dir.join("micromamba.tar.bz2");
-                                    let mut file = match fs::File::create(&temp_file) {
-                                        Ok(f) => f,
-                                        Err(e) => {
-                                            let error_msg =
-                                                format!("Failed to create temp file: {}", e);
-                                            warn!("{}: {}", source_name, error_msg);
-                                            last_error =
-                                                Some(format!("{}: {}", source_name, error_msg));
-                                            continue;
-                                        }
-                                    };
-
-                                    if let Err(e) = file.write_all(&bytes) {
-                                        let error_msg = format!("Failed to write temp file: {}", e);
-                                        warn!("{}: {}", source_name, error_msg);
-                                        last_error =
-                                            Some(format!("{}: {}", source_name, error_msg));
-                                        continue;
-                                    }
-
-                                    // Extract the tar.bz2 archive
-                                    info!("Extracting micromamba from tar.bz2 archive...");
-                                    let extract_output = AsyncCommand::new("tar")
-                                        .args(&[
-                                            "-xjf",
-                                            temp_file.to_str().unwrap(),
-                                            "-C",
-                                            install_dir.to_str().unwrap(),
-                                        ])
-                                        .output()
-                                        .await;
-
-                                    match extract_output {
-                                        Ok(output) => {
-                                            if !output.status.success() {
-                                                let error = String::from_utf8_lossy(&output.stderr);
-                                                warn!("Failed to extract archive: {}", error);
-                                                last_error = Some(format!(
-                                                    "{}: Extraction failed: {}",
-                                                    source_name, error
-                                                ));
-                                                continue;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!("Failed to run tar command: {}", e);
-                                            last_error = Some(format!(
-                                                "{}: Failed to run tar: {}",
-                                                source_name, e
-                                            ));
-                                            continue;
-                                        }
-                                    }
-
-                                    // Clean up temp file
-                                    if let Err(e) = fs::remove_file(&temp_file) {
-                                        warn!("Failed to remove temp file: {}", e);
-                                    }
-                                } else {
-                                    // Direct binary download (GitHub)
-                                    let mut file = match fs::File::create(&binary_path) {
-                                        Ok(f) => f,
-                                        Err(e) => {
-                                            let error_msg = format!("Failed to create file: {}", e);
-                                            warn!("{}: {}", source_name, error_msg);
-                                            last_error =
-                                                Some(format!("{}: {}", source_name, error_msg));
-                                            continue;
-                                        }
-                                    };
-
-                                    if let Err(e) = file.write_all(&bytes) {
-                                        let error_msg = format!("Failed to write file: {}", e);
-                                        warn!("{}: {}", source_name, error_msg);
-                                        last_error =
-                                            Some(format!("{}: {}", source_name, error_msg));
-                                        continue;
-                                    }
-                                }
-
-                                pb.finish_and_clear();
-                                info!("Successfully downloaded micromamba from {}", source_name);
-
-                                // Set execute permissions on Unix
-                                #[cfg(unix)]
-                                {
-                                    let mut perms =
-                                        match fs::metadata(&binary_path).map(|m| m.permissions()) {
-                                            Ok(p) => p,
-                                            Err(e) => {
-                                                warn!("Failed to get file permissions: {}", e);
-                                                continue;
-                                            }
-                                        };
-                                    perms.set_mode(0o755);
-                                    if let Err(e) = fs::set_permissions(&binary_path, perms) {
-                                        warn!("Failed to set execute permissions: {}", e);
-                                        // Don't fail on permission errors
-                                    }
-                                }
-
-                                // Success!
-                                break;
-                            }
-                            Err(e) => {
-                                let error_msg = format!("Failed to read response: {}", e);
-                                warn!("{}: {}", source_name, error_msg);
-                                last_error = Some(format!("{}: {}", source_name, error_msg));
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = format!("Connection failed: {}", e);
-                        warn!("{}: {}", source_name, error_msg);
-                        last_error = Some(format!("{}: {}", source_name, error_msg));
-                        continue;
-                    }
-                }
-            }
-
-            // Handle nested directory case for tar.bz2 archives
-            // Some micromamba tar.bz2 packages create a nested directory structure
-            if binary_path.exists() {
-                // If binary_path is a directory, we need to find the actual binary
-                if binary_path.is_dir() {
-                    let nested_dir = binary_path.join("bin");
-                    if nested_dir.exists() && nested_dir.is_dir() {
-                        let nested_binary = nested_dir.join("micromamba");
-                        if nested_binary.exists() {
-                            info!("Detected nested directory structure, moving binary to correct location...");
-                            // Create a temporary path for the binary
-                            let temp_binary_path =
-                                binary_path.parent().unwrap().join("micromamba.tmp");
-
-                            // First copy to a temporary location
-                            if let Err(e) = fs::copy(&nested_binary, &temp_binary_path) {
-                                warn!("Failed to copy nested binary to temp location: {}", e);
-                            } else {
-                                // Remove the entire nested directory
-                                if let Err(e) = fs::remove_dir_all(&binary_path) {
-                                    warn!("Failed to remove nested directory: {}", e);
-                                    // Clean up temp file
-                                    let _ = fs::remove_file(&temp_binary_path);
-                                } else {
-                                    // Now move the temp file to the final location
-                                    if let Err(e) = fs::rename(&temp_binary_path, &binary_path) {
-                                        warn!("Failed to rename temp binary: {}", e);
-                                    } else {
-                                        #[cfg(unix)]
-                                        {
-                                            if let Ok(metadata) = fs::metadata(&binary_path) {
-                                                let mut perms = metadata.permissions();
-                                                perms.set_mode(0o755);
-                                                if let Err(e) =
-                                                    fs::set_permissions(&binary_path, perms)
-                                                {
-                                                    warn!(
-                                                        "Failed to set execute permissions: {}",
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        info!("Successfully moved micromamba binary to correct location");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Check if we successfully downloaded
-            if !binary_path.exists() {
-                return Err(EnvError::Network(format!(
-                    "Failed to download micromamba from all sources. Tried:\n  - {}\n  - {}\n\nLast error: {}\n\nPlease install micromamba manually from https://github.com/mamba-org/micromamba-releases and add it to your PATH, or set the MICROMAMBA_PATH environment variable.",
-                    download_urls[0].0,
-                    download_urls[1].0,
-                    last_error.unwrap_or_else(|| "Unknown error".to_string())
-                )));
-            }
-        } else {
-            info!("Micromamba binary already exists, skipping download");
-        }
-
-        Ok(binary_path)
+    /// Find an explicitly installed micromamba executable without network access.
+    pub fn find_micromamba() -> Result<PathBuf> {
+        let explicitly_configured_path = std::env::var_os("ENVA_MICROMAMBA_PATH")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let path_discovery_result = which("micromamba").ok();
+        resolve_micromamba_path(explicitly_configured_path, path_discovery_result)
     }
 
     /// Initialize environments from config directory
@@ -1159,6 +808,8 @@ impl MicromambaManager {
         force: bool,
         output_mode: OutputMode,
     ) -> Result<()> {
+        let environment_name = EnvironmentName::parse(env_name.to_string())?;
+        let env_name = environment_name.as_str();
         let _lock = self.creation_lock.lock().await;
 
         info!("create_environment called for {:?}", yaml_file);
@@ -1270,9 +921,7 @@ impl MicromambaManager {
             }
 
             if stderr.contains("Non-conda folder exists at prefix") {
-                let error_msg = format!(
-                    "Failed to create environment: Environment directory already exists but is not a valid conda environment. Please remove the existing directory and try again, or use a different environment name."
-                );
+                let error_msg = "Failed to create environment: Environment directory already exists but is not a valid conda environment. Please remove the existing directory and try again, or use a different environment name.".to_string();
                 error!("{}", error_msg);
                 return Err(EnvError::Execution(error_msg));
             }
@@ -1299,18 +948,14 @@ impl MicromambaManager {
         &self,
         target_flag: &str,
         target: &str,
-        command: &str,
+        command: &RunCommand,
         env_vars: &[String],
         cwd: &Path,
         capture_output: bool,
     ) -> Result<()> {
         let mut cmd = AsyncCommand::new(&self.pm_path);
-        cmd.arg("run")
-            .arg(target_flag)
-            .arg(target)
-            .arg("bash")
-            .arg("-lc")
-            .arg(command);
+        cmd.arg("run").arg(target_flag).arg(target).arg("--");
+        append_environment_run_command(&mut cmd, command)?;
         cmd.current_dir(cwd);
 
         self.apply_env_to_command(&mut cmd);
@@ -1355,10 +1000,9 @@ impl MicromambaManager {
             };
 
         if !output.status.success() {
-            return Err(EnvError::Execution(format!(
-                "Command failed with exit code {:?}",
-                output.status.code()
-            )));
+            return Err(EnvError::ProcessExit {
+                code: output.status.code(),
+            });
         }
 
         Ok(())
@@ -1367,13 +1011,8 @@ impl MicromambaManager {
     /// Run command in environment
     pub async fn run_in_environment(&self, env_name: &str, command: &str) -> Result<Output> {
         let mut cmd = AsyncCommand::new(&self.pm_path);
-        cmd.arg("run")
-            .arg("-n")
-            .arg(env_name)
-            .arg("--")
-            .arg("bash")
-            .arg("-lc")
-            .arg(command);
+        cmd.arg("run").arg("-n").arg(env_name).arg("--");
+        append_environment_shell_arguments(&mut cmd, command);
 
         self.apply_env_to_command(&mut cmd);
 
@@ -1386,7 +1025,7 @@ impl MicromambaManager {
     pub async fn run_in_environment_extended(
         &self,
         env_name: &str,
-        command: &str,
+        command: &RunCommand,
         env_vars: &[String],
         cwd: &Path,
         capture_output: bool,
@@ -1399,7 +1038,7 @@ impl MicromambaManager {
     pub async fn run_in_environment_by_prefix_extended(
         &self,
         prefix: &Path,
-        command: &str,
+        command: &RunCommand,
         env_vars: &[String],
         cwd: &Path,
         capture_output: bool,
@@ -1602,8 +1241,14 @@ impl MicromambaManager {
         env_name: &str,
         output_mode: OutputMode,
     ) -> Result<()> {
-        self.remove_environment_target_with_output("-n", env_name, env_name, output_mode)
-            .await
+        let environment_name = EnvironmentName::parse(env_name.to_string())?;
+        self.remove_environment_target_with_output(
+            "-n",
+            environment_name.as_str(),
+            environment_name.as_str(),
+            output_mode,
+        )
+        .await
     }
 
     pub async fn remove_environment_by_prefix_with_output(
@@ -2188,5 +1833,66 @@ dependencies:
 
         MicromambaManager::restore_ownership_marker(&prefix, stashed).unwrap();
         assert!(!prefix.join("conda-meta").join("enva-rattler.json").exists());
+    }
+
+    #[cfg(unix)]
+    fn create_fake_micromamba(binary_path: &Path, version: &str) {
+        fs::write(
+            binary_path,
+            format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n"),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(binary_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(binary_path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicitly_configured_micromamba_path_takes_precedence() {
+        let temporary_directory = tempdir().unwrap();
+        let configured_binary = temporary_directory.path().join("configured-micromamba");
+        let path_binary = temporary_directory.path().join("path-micromamba");
+        create_fake_micromamba(&configured_binary, "configured");
+        create_fake_micromamba(&path_binary, "path");
+
+        let resolved =
+            resolve_micromamba_path(Some(configured_binary.clone()), Some(path_binary)).unwrap();
+
+        assert_eq!(resolved, configured_binary.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_explicit_path_does_not_fall_back_to_path_discovery() {
+        let temporary_directory = tempdir().unwrap();
+        let missing_binary = temporary_directory.path().join("missing-micromamba");
+        let path_binary = temporary_directory.path().join("path-micromamba");
+        create_fake_micromamba(&path_binary, "path");
+
+        let error = resolve_micromamba_path(Some(missing_binary), Some(path_binary)).unwrap_err();
+
+        assert!(error.to_string().contains("ENVA_MICROMAMBA_PATH"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_discovery_accepts_an_existing_healthy_executable() {
+        let temporary_directory = tempdir().unwrap();
+        let path_binary = temporary_directory.path().join("micromamba");
+        create_fake_micromamba(&path_binary, "2.8.1");
+
+        let resolved = resolve_micromamba_path(None, Some(path_binary.clone())).unwrap();
+
+        assert_eq!(resolved, path_binary.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn missing_micromamba_returns_manual_installation_guidance() {
+        let error = resolve_micromamba_path(None, None).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("optional compatibility backend"));
+        assert!(message.contains("ENVA_MICROMAMBA_PATH"));
     }
 }

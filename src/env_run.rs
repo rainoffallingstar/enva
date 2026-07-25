@@ -1,13 +1,17 @@
 //! Environment run command
 
 use crate::backend::factory::build_backend;
-use crate::backend::{BackendKind, BackendSelector, EnvironmentTarget, RunRequest};
+use crate::backend::{
+    BackendCapability, BackendKind, BackendSelector, EnvironmentName, EnvironmentResolution,
+    EnvironmentTarget, RunCommand, RunRequest,
+};
 use crate::error::{EnvError, Result};
 use crate::package_manager::{PackageManager, PackageManagerDetector};
 use clap::Args;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Environment run arguments
 /// Supports both positional and flag-based syntax:
@@ -38,7 +42,7 @@ pub struct EnvRunArgs {
 
     /// Positional arguments: [env_name, command_parts...]
     #[arg(value_name = "ARGS")]
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
 
     /// Working directory
     #[arg(short, long, default_value = ".")]
@@ -54,42 +58,48 @@ pub struct EnvRunArgs {
 }
 
 impl EnvRunArgs {
-    /// Get environment name (resolve from either --name flag or first positional arg)
-    pub fn get_env_name(&self) -> Result<String> {
-        if let Some(ref name) = self.name {
-            return Ok(name.clone());
+    pub fn get_env_name(&self) -> Result<EnvironmentName> {
+        if let Some(name) = &self.name {
+            return EnvironmentName::parse(name.clone());
         }
 
-        if !self.args.is_empty() && self.prefix.is_none() {
-            return Ok(self.args[0].clone());
+        if self.prefix.is_none() {
+            let positional_name = self
+                .args
+                .first()
+                .ok_or_else(|| EnvError::Validation("Missing environment name".to_string()))?;
+            let positional_name = positional_name.to_str().ok_or_else(|| {
+                EnvError::Validation("Environment name must be valid UTF-8".to_string())
+            })?;
+            return EnvironmentName::parse(positional_name.to_string());
         }
 
         Err(EnvError::Validation("Missing environment name".to_string()))
     }
 
-    /// Get command (resolve from either --command flag or positional args)
-    pub fn get_command(&self) -> Result<String> {
-        if let Some(ref cmd) = self.command {
-            return Ok(cmd.clone());
-        }
-
-        let start_idx = if self.name.is_some() || self.prefix.is_some() {
+    fn command_arguments(&self) -> &[OsString] {
+        let start_index = if self.name.is_some() || self.prefix.is_some() {
             0
         } else {
             1
         };
-        let args: Vec<&str> = self
-            .args
-            .iter()
-            .skip(start_idx)
-            .map(|value| value.as_str())
-            .collect();
+        &self.args[start_index.min(self.args.len())..]
+    }
 
-        if args.is_empty() {
-            return Err(EnvError::Validation("Missing command".to_string()));
+    pub fn get_run_command(&self) -> Result<RunCommand> {
+        if let Some(command) = &self.command {
+            return RunCommand::shell(command.clone());
         }
 
-        Ok(args.join(" "))
+        if let Some(script) = &self.script {
+            let mut arguments = Vec::with_capacity(self.command_arguments().len() + 2);
+            arguments.push(OsString::from("Rscript"));
+            arguments.push(script.as_os_str().to_os_string());
+            arguments.extend(self.command_arguments().iter().cloned());
+            return RunCommand::argv(arguments);
+        }
+
+        RunCommand::argv(self.command_arguments().to_vec())
     }
 }
 
@@ -132,13 +142,30 @@ fn format_candidates(candidates: &[ResolvedEnvironment]) -> String {
         .join(", ")
 }
 
+fn require_unique_environment(
+    env_name: &str,
+    candidates: Vec<ResolvedEnvironment>,
+    not_found_message: String,
+) -> Result<ResolvedEnvironment> {
+    match EnvironmentResolution::from_candidates(candidates) {
+        EnvironmentResolution::NotFound => Err(EnvError::Execution(not_found_message)),
+        EnvironmentResolution::Unique(environment) => Ok(environment),
+        EnvironmentResolution::Ambiguous(environments) => Err(EnvError::Execution(format!(
+            "Environment '{}' matched multiple accessible prefixes: {}. Use --prefix to disambiguate.",
+            env_name,
+            format_candidates(&environments)
+        ))),
+    }
+}
+
 fn select_package_managers(
     requested_pm: Option<PackageManager>,
     available: &[PackageManager],
 ) -> Result<Vec<PackageManager>> {
     if available.is_empty() {
         return Err(EnvError::Execution(
-            "No package manager found and auto-install failed.".to_string(),
+            "No compatibility package manager is installed. Add conda, mamba, or micromamba to PATH; micromamba may also be configured with ENVA_MICROMAMBA_PATH."
+                .to_string(),
         ));
     }
 
@@ -242,39 +269,21 @@ async fn resolve_environment_by_name(
                 }
             }
 
-            if candidates.is_empty() {
-                return Err(EnvError::Execution(format!(
+            require_unique_environment(
+                env_name,
+                candidates,
+                format!(
                     "Environment '{}' was not found in any available package manager. Searched: {}",
                     env_name,
                     format_package_managers(&package_managers)
-                )));
-            }
-
-            let selected = candidates[0].clone();
-            if candidates.len() > 1 {
-                warn!(
-                    "Environment '{}' was found in multiple package managers. Using {}:{} (candidates: {})",
-                    env_name,
-                    backend_label(selected.backend_kind, selected.package_manager),
-                    selected.prefix.display(),
-                    format_candidates(&candidates)
-                );
-            }
-
-            Ok(selected)
+                ),
+            )
         }
         BackendKind::Rattler => {
             let backend = build_backend(selector).await?;
-            let prefixes = backend.find_environment_prefixes(env_name).await?;
-
-            if prefixes.is_empty() {
-                return Err(EnvError::Execution(format!(
-                    "Environment '{}' was not found in accessible environment prefixes",
-                    env_name
-                )));
-            }
-
-            let candidates = prefixes
+            let candidates = backend
+                .find_environment_prefixes(env_name)
+                .await?
                 .into_iter()
                 .map(|prefix| ResolvedEnvironment {
                     backend: backend.clone(),
@@ -285,18 +294,14 @@ async fn resolve_environment_by_name(
                 })
                 .collect::<Vec<ResolvedEnvironment>>();
 
-            let selected = candidates[0].clone();
-            if candidates.len() > 1 {
-                warn!(
-                    "Environment '{}' was found in multiple accessible prefixes. Using {}:{} (candidates: {})",
-                    env_name,
-                    backend_label(selected.backend_kind, selected.package_manager),
-                    selected.prefix.display(),
-                    format_candidates(&candidates)
-                );
-            }
-
-            Ok(selected)
+            require_unique_environment(
+                env_name,
+                candidates,
+                format!(
+                    "Environment '{}' was not found in accessible environment prefixes",
+                    env_name
+                ),
+            )
         }
     }
 }
@@ -365,23 +370,27 @@ pub(crate) async fn resolve_environment_reference(
 pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
     validate_args(&args)?;
 
-    let full_command = build_full_command(&args)?;
+    let run_command = args.get_run_command()?;
+    let command_display = run_command.display_lossy();
     let selector = BackendSelector::from_env();
 
     let env_name = if args.prefix.is_some() {
-        args.name.clone()
+        args.name
+            .as_ref()
+            .map(|name| EnvironmentName::parse(name.clone()))
+            .transpose()?
     } else {
         Some(args.get_env_name()?)
     };
 
     if verbose {
-        if let Some(ref name) = env_name {
-            info!("Executing in environment '{}': {}", name, full_command);
-        } else if let Some(ref prefix) = args.prefix {
+        if let Some(name) = &env_name {
+            info!("Executing in environment '{}': {}", name, command_display);
+        } else if let Some(prefix) = &args.prefix {
             info!(
                 "Executing in explicit environment prefix '{}': {}",
                 prefix.display(),
-                full_command
+                command_display
             );
         }
     }
@@ -391,8 +400,9 @@ pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
     } else {
         resolve_environment_by_name(
             env_name
-                .as_deref()
-                .ok_or_else(|| EnvError::Validation("Missing environment name".to_string()))?,
+                .as_ref()
+                .ok_or_else(|| EnvError::Validation("Missing environment name".to_string()))?
+                .as_str(),
             selector.clone(),
             args.pm,
         )
@@ -424,11 +434,12 @@ pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
         );
     }
 
+    backend.require_capability(BackendCapability::RunByPrefix)?;
     match backend
         .run(
             &EnvironmentTarget::Prefix(prefix.clone()),
             &RunRequest {
-                command: full_command.clone(),
+                command: run_command.clone(),
                 env_vars: args.env.clone(),
                 cwd: args.cwd.clone(),
                 capture_output: !args.no_capture,
@@ -443,35 +454,10 @@ pub async fn execute_env_run(args: EnvRunArgs, verbose: bool) -> Result<()> {
             Ok(())
         }
         Err(error) => {
-            let error_msg = format!("{}", error);
-            if error_msg.contains("exit code Some(141)") {
-                if verbose {
-                    info!("Received SIGPIPE (exit code 141), but this is often harmless");
-                    info!("Command likely completed successfully before pipe was closed");
-                }
-                Ok(())
-            } else {
-                error!("Failed to execute command: {}", error);
-                Err(error)
-            }
+            error!("Failed to execute command: {}", error);
+            Err(error)
         }
     }
-}
-
-/// Build the full command string from arguments
-fn build_full_command(args: &EnvRunArgs) -> Result<String> {
-    if let Some(ref script) = args.script {
-        let mut cmd = format!("Rscript {}", script.display());
-
-        if !args.args.is_empty() {
-            cmd.push(' ');
-            cmd.push_str(&args.args.join(" "));
-        }
-
-        return Ok(cmd);
-    }
-
-    args.get_command()
 }
 
 /// Validate command arguments
@@ -533,6 +519,39 @@ fn validate_args(args: &EnvRunArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_unique_environment_rejects_ambiguous_prefixes() {
+        let backend: Arc<dyn crate::backend::EnvironmentBackend> = Arc::new(
+            crate::backend::cli::CliBackend::new(Some(PackageManager::Conda)),
+        );
+        let candidates = vec![
+            ResolvedEnvironment {
+                backend: backend.clone(),
+                backend_kind: BackendKind::Cli,
+                package_manager: Some(PackageManager::Conda),
+                prefix: PathBuf::from("/first/envs/demo"),
+                requested_name: Some("demo".to_string()),
+            },
+            ResolvedEnvironment {
+                backend,
+                backend_kind: BackendKind::Cli,
+                package_manager: Some(PackageManager::Conda),
+                prefix: PathBuf::from("/second/envs/demo"),
+                requested_name: Some("demo".to_string()),
+            },
+        ];
+
+        let error = require_unique_environment("demo", candidates, "not found".to_string())
+            .err()
+            .expect("ambiguous names must fail closed");
+        let message = error.to_string();
+
+        assert!(message.contains("matched multiple accessible prefixes"));
+        assert!(message.contains("/first/envs/demo"));
+        assert!(message.contains("/second/envs/demo"));
+        assert!(message.contains("Use --prefix to disambiguate"));
+    }
 
     #[test]
     fn test_validate_args_both_command_and_script() {
@@ -625,20 +644,32 @@ mod tests {
     }
 
     #[test]
-    fn test_get_command_with_prefix_uses_all_positional_args() {
+    fn test_get_run_command_with_prefix_preserves_all_positional_args() {
+        let expected_arguments = vec![
+            OsString::from("echo"),
+            OsString::from("value with spaces"),
+            OsString::from("semi;colon"),
+            OsString::from("$(printf injected)"),
+            OsString::from("*.fastq.gz"),
+            OsString::from("line one\nline two"),
+            OsString::from("-leading-option"),
+        ];
         let args = EnvRunArgs {
             name: None,
             pm: None,
             prefix: Some(PathBuf::from(".")),
             command: None,
             script: None,
-            args: vec!["echo".to_string(), "hello".to_string()],
+            args: expected_arguments.clone(),
             cwd: PathBuf::from("."),
             env: vec![],
             no_capture: false,
         };
 
-        assert_eq!(args.get_command().unwrap(), "echo hello");
+        assert_eq!(
+            args.get_run_command().unwrap(),
+            RunCommand::Argv(expected_arguments)
+        );
     }
 
     #[test]
@@ -661,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_full_command_from_command_flag() {
+    fn test_command_flag_uses_explicit_shell_mode() {
         let args = EnvRunArgs {
             name: Some("test-env".to_string()),
             pm: None,
@@ -674,7 +705,47 @@ mod tests {
             no_capture: false,
         };
 
-        assert_eq!(build_full_command(&args).unwrap(), "echo test");
+        assert_eq!(
+            args.get_run_command().unwrap(),
+            RunCommand::Shell("echo test".to_string())
+        );
+    }
+
+    #[test]
+    fn test_script_uses_argv_mode_and_preserves_arguments() {
+        let script_path = PathBuf::from("script path/test.R");
+        let args = EnvRunArgs {
+            name: Some("test-env".to_string()),
+            pm: None,
+            prefix: None,
+            command: None,
+            script: Some(script_path.clone()),
+            args: vec![
+                OsString::from("value with spaces"),
+                OsString::from("semi;colon"),
+                OsString::from("$(printf injected)"),
+                OsString::from("*.fastq.gz"),
+                OsString::from("line one\nline two"),
+                OsString::from("-leading-option"),
+            ],
+            cwd: PathBuf::from("."),
+            env: vec![],
+            no_capture: false,
+        };
+
+        assert_eq!(
+            args.get_run_command().unwrap(),
+            RunCommand::Argv(vec![
+                OsString::from("Rscript"),
+                script_path.into_os_string(),
+                OsString::from("value with spaces"),
+                OsString::from("semi;colon"),
+                OsString::from("$(printf injected)"),
+                OsString::from("*.fastq.gz"),
+                OsString::from("line one\nline two"),
+                OsString::from("-leading-option"),
+            ])
+        );
     }
 
     #[test]

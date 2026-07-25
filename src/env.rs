@@ -1,13 +1,11 @@
 //! Environment management commands
 
 use crate::backend::factory::build_default_backend;
-use crate::backend::OutputMode;
+use crate::backend::{BackendCapability, EnvironmentName, EnvironmentTarget, OutputMode};
 use crate::error::{EnvError, Result};
 use crate::micromamba::CondaEnvironment;
 use crate::package_manager::PackageManager;
 use clap::{Args, Subcommand, ValueEnum};
-use std::collections::HashSet;
-use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
@@ -66,7 +64,7 @@ pub struct EnvCreateArgs {
     #[arg(long)]
     pub clean_cache: bool,
 
-    /// Additional packages to install immediately after creation (comma-separated or repeated)
+    /// Additional packages to install immediately after creation (repeat the flag for multiple specs)
     #[arg(long = "with", value_name = "PKG")]
     pub with: Vec<String>,
 
@@ -98,13 +96,17 @@ pub struct EnvListArgs {
 /// Environment install arguments
 #[derive(Debug, Clone, Args)]
 pub struct EnvInstallArgs {
-    /// Package names to install (comma-separated or multiple flags)
+    /// Package specs to install (provide one spec per argument)
     #[arg(required = true)]
     pub packages: Vec<String>,
 
     /// Environment name
-    #[arg(long)]
+    #[arg(long, conflicts_with = "prefix")]
     pub name: Option<String>,
+
+    /// Explicit environment prefix; required when a name is ambiguous
+    #[arg(long, value_name = "PREFIX", conflicts_with = "name")]
+    pub prefix: Option<PathBuf>,
 }
 
 /// Environment adoption arguments
@@ -225,9 +227,17 @@ pub enum EnvCommand {
 
     /// Remove conda environment
     Remove {
-        /// Environment names
-        #[arg(required = true, value_name = "ENV")]
+        /// Environment names; each name must resolve uniquely
+        #[arg(
+            value_name = "ENV",
+            required_unless_present = "prefix",
+            conflicts_with = "prefix"
+        )]
         names: Vec<String>,
+
+        /// Explicit environment prefix; required when a name is ambiguous
+        #[arg(long, value_name = "PREFIX", conflicts_with = "names")]
+        prefix: Option<PathBuf>,
     },
 
     /// Emit shell code to activate an environment in the current shell
@@ -257,7 +267,7 @@ pub async fn execute_env_command(
         EnvCommand::Validate(args) => execute_env_validate(args, verbose, dry_run, json).await,
         EnvCommand::Install(args) => execute_env_install(args, verbose).await,
         EnvCommand::Adopt(args) => execute_env_adopt(args, verbose).await,
-        EnvCommand::Remove { names } => execute_env_remove(names, verbose).await,
+        EnvCommand::Remove { names, prefix } => execute_env_remove(names, prefix, verbose).await,
         EnvCommand::Activate(args) => execute_env_activate(args, verbose).await,
         EnvCommand::Deactivate(args) => execute_env_deactivate(args, verbose).await,
         EnvCommand::Shell(args) => execute_env_shell(args, verbose).await,
@@ -274,17 +284,12 @@ fn execution_output_mode(verbose: bool) -> OutputMode {
 }
 
 fn parse_package_specs(package_specs: &[String]) -> Vec<String> {
-    let mut packages = Vec::new();
-    for pkg_list in package_specs {
-        for pkg in pkg_list
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            packages.push(pkg.to_string());
-        }
-    }
-    packages
+    package_specs
+        .iter()
+        .map(|package_spec| package_spec.trim())
+        .filter(|package_spec| !package_spec.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn parse_remove_names(names: &[String]) -> Vec<String> {
@@ -384,6 +389,10 @@ async fn execute_env_create(
         }
     }
 
+    for environment_name in &environments_to_create {
+        EnvironmentName::parse((*environment_name).to_string())?;
+    }
+
     if verbose {
         info!(
             "Creating {} environments: {:?}",
@@ -399,47 +408,46 @@ async fn execute_env_create(
     }
 
     if dry_run {
+        let validation_capability = if packages_to_install.is_empty() {
+            BackendCapability::ValidateYaml
+        } else {
+            BackendCapability::ValidateYamlWithPackages
+        };
+        backend.require_capability(validation_capability)?;
+    } else {
+        backend.require_capability(BackendCapability::CreateEnvironment)?;
+        if !packages_to_install.is_empty() {
+            backend.require_capability(BackendCapability::InstallByName)?;
+        }
+        if args.clean_cache {
+            backend.require_capability(BackendCapability::CleanPackageCache)?;
+        }
+    }
+
+    if dry_run {
         use serde_json::{json, Value};
         let mut results = Vec::new();
 
         for env_name in &environments_to_create {
             let yaml_file = resolve_yaml_file(env_name, args.yaml.as_ref())?;
-            let file_exists = yaml_file.exists();
-            let file_path_str = yaml_file.to_string_lossy().to_string();
+            let validation = backend
+                .validate_yaml_with_packages(&yaml_file, &packages_to_install)
+                .await?;
+            let mut result = serde_json::to_value(validation)?;
+            if let Value::Object(ref mut fields) = result {
+                fields.insert(
+                    "additional_packages".to_string(),
+                    json!(packages_to_install.clone()),
+                );
+            }
 
-            if json {
-                results.push(json!({
-                    "environment": env_name,
-                    "yaml_file": file_path_str,
-                    "file_exists": file_exists,
-                    "action": "create",
-                    "dry_run": true,
-                    "additional_packages": packages_to_install.clone(),
-                    "status": if file_exists { "ready" } else { "file_not_found" }
-                }));
-            } else {
+            if !json {
                 println!("[DRY-RUN] Environment: {}", env_name);
-                println!("[DRY-RUN] YAML file: {}", file_path_str);
-                println!(
-                    "[DRY-RUN] File exists: {}",
-                    if file_exists { "YES" } else { "NO" }
-                );
-                if !packages_to_install.is_empty() {
-                    println!(
-                        "[DRY-RUN] Additional packages: {}",
-                        packages_to_install.join(", ")
-                    );
-                }
-                println!(
-                    "[DRY-RUN] Status: {}",
-                    if file_exists {
-                        "Ready to create"
-                    } else {
-                        "File not found!"
-                    }
-                );
+                println!("[DRY-RUN] YAML validation and dependency solve succeeded");
+                println!("{}", serde_json::to_string_pretty(&result)?);
                 println!("{}", "-".repeat(50));
             }
+            results.push(result);
         }
 
         if json {
@@ -551,6 +559,7 @@ async fn execute_env_validate(
     }
 
     let backend = build_default_backend().await?;
+    backend.require_capability(BackendCapability::DiscoverEnvironments)?;
 
     if args.all || args.name.is_none() {
         // Validate all environments by checking if they exist
@@ -633,7 +642,25 @@ async fn execute_env_install(args: EnvInstallArgs, verbose: bool) -> Result<()> 
 
     let backend = build_default_backend().await?;
 
-    let env_name = args.name.as_deref().unwrap_or("xdxtools-core");
+    let target = match (args.name.as_deref(), args.prefix.as_ref()) {
+        (Some(env_name), None) => {
+            EnvironmentName::parse(env_name.to_string())?;
+            crate::backend::EnvironmentTarget::Name(env_name.to_string())
+        }
+        (None, Some(prefix)) => crate::backend::EnvironmentTarget::Prefix(prefix.clone()),
+        (None, None) => crate::backend::EnvironmentTarget::Name("xdxtools-core".to_string()),
+        (Some(_), Some(_)) => {
+            return Err(EnvError::Validation(
+                "Must specify at most one of --name or --prefix".to_string(),
+            ))
+        }
+    };
+
+    let install_capability = match &target {
+        EnvironmentTarget::Name(_) => BackendCapability::InstallByName,
+        EnvironmentTarget::Prefix(_) => BackendCapability::InstallByPrefix,
+    };
+    backend.require_capability(install_capability)?;
 
     let packages_to_install = parse_package_specs(&args.packages);
 
@@ -644,20 +671,30 @@ async fn execute_env_install(args: EnvInstallArgs, verbose: bool) -> Result<()> 
     }
 
     if verbose {
-        info!("Installing packages in environment: {}", env_name);
+        match &target {
+            crate::backend::EnvironmentTarget::Name(env_name) => {
+                info!("Installing packages in environment: {}", env_name);
+            }
+            crate::backend::EnvironmentTarget::Prefix(prefix) => {
+                info!(
+                    "Installing packages in explicit prefix: {}",
+                    prefix.display()
+                );
+            }
+        }
         info!("Packages to install: {:?}", packages_to_install);
     }
 
     match backend
-        .install_packages(
-            env_name,
+        .install_packages_for_target(
+            &target,
             &packages_to_install,
             execution_output_mode(verbose),
         )
         .await
     {
         Ok(_) => {
-            info!("Successfully installed packages in {}", env_name);
+            info!("Successfully installed requested packages");
             Ok(())
         }
         Err(e) => {
@@ -682,237 +719,51 @@ async fn execute_env_adopt(args: EnvAdoptArgs, verbose: bool) -> Result<()> {
         }
     };
 
+    backend.require_capability(BackendCapability::AdoptEnvironment)?;
     backend
         .adopt_environment(&target, execution_output_mode(verbose))
         .await
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RemoveSelection {
-    Indexes(Vec<usize>),
-    All,
-    Skip,
-}
+/// Execute environment removal
+async fn execute_env_remove(
+    names: Vec<String>,
+    explicit_prefix: Option<PathBuf>,
+    verbose: bool,
+) -> Result<()> {
+    let backend = build_default_backend().await?;
+    let output_mode = execution_output_mode(verbose);
 
-fn sort_remove_matches(matches: &mut [CondaEnvironment]) {
-    matches.sort_by(|left, right| {
-        owner_priority_label(left.owner.as_deref())
-            .cmp(&owner_priority_label(right.owner.as_deref()))
-            .then_with(|| {
-                source_priority_label(left.source.as_deref())
-                    .cmp(&source_priority_label(right.source.as_deref()))
-            })
-            .then_with(|| right.is_active.cmp(&left.is_active))
-            .then(left.prefix.cmp(&right.prefix))
-    });
-}
-
-fn matching_remove_candidates(
-    environments: &[CondaEnvironment],
-    env_name: &str,
-) -> Vec<CondaEnvironment> {
-    let mut matches = environments
-        .iter()
-        .filter(|environment| environment.name == env_name)
-        .cloned()
-        .collect::<Vec<CondaEnvironment>>();
-    sort_remove_matches(&mut matches);
-    matches
-}
-
-fn parse_remove_selection(input: &str, max_index: usize) -> Result<RemoveSelection> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err(EnvError::Validation(
-            "Selection cannot be empty".to_string(),
-        ));
+    if let Some(prefix) = explicit_prefix {
+        backend.require_capability(BackendCapability::RemoveByPrefix)?;
+        return backend
+            .remove_environment_by_prefix_with_output(&prefix, output_mode)
+            .await;
     }
 
-    if trimmed.eq_ignore_ascii_case("a") || trimmed.eq_ignore_ascii_case("all") {
-        return Ok(RemoveSelection::All);
+    backend.require_capability(BackendCapability::RemoveByName)?;
+    let parsed_names = parse_remove_names(&names);
+    for environment_name in &parsed_names {
+        EnvironmentName::parse(environment_name.clone())?;
     }
 
-    if trimmed.eq_ignore_ascii_case("s") || trimmed.eq_ignore_ascii_case("skip") {
-        return Ok(RemoveSelection::Skip);
-    }
-
-    let mut indexes = Vec::new();
-    let mut seen = HashSet::new();
-    for token in trimmed
-        .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
-        .filter(|token| !token.is_empty())
-    {
-        let parsed = token.parse::<usize>().map_err(|_| {
-            EnvError::Validation(format!(
-                "Invalid selection '{}'. Enter indexes like '1' or '1,2', 'all', or 'skip'",
-                token
-            ))
-        })?;
-
-        if parsed == 0 || parsed > max_index {
-            return Err(EnvError::Validation(format!(
-                "Selection '{}' is out of range 1..={}",
-                parsed, max_index
-            )));
-        }
-
-        let zero_based = parsed - 1;
-        if seen.insert(zero_based) {
-            indexes.push(zero_based);
-        }
-    }
-
-    if indexes.is_empty() {
-        return Err(EnvError::Validation(
-            "Selection cannot be empty".to_string(),
-        ));
-    }
-
-    Ok(RemoveSelection::Indexes(indexes))
-}
-
-fn render_remove_candidates(name: &str, matches: &[CondaEnvironment]) -> String {
-    let mut lines = vec![
-        format!(
-            "Environment '{}' matched multiple accessible prefixes. Select which ones to remove:",
-            name
-        ),
-        "  a/all  remove all matches".to_string(),
-        "  s/skip skip this environment".to_string(),
-    ];
-
-    for (index, environment) in matches.iter().enumerate() {
-        let mut details = Vec::new();
-        details.push(format!(
-            "owner={}",
-            environment.owner.as_deref().unwrap_or("unknown")
-        ));
-        details.push(format!(
-            "source={}",
-            environment.source.as_deref().unwrap_or("unknown")
-        ));
-        if let Some(adopted_from) = environment.adopted_from.as_deref() {
-            details.push(format!("adopted_from={}", adopted_from));
-        }
-        if environment.is_active {
-            details.push("active".to_string());
-        }
-
-        lines.push(format!(
-            "  {}. {} ({})",
-            index + 1,
-            environment.prefix,
-            details.join(", ")
-        ));
-    }
-
-    lines.join("\n")
-}
-
-fn select_remove_candidates_interactively(
-    name: &str,
-    matches: &[CondaEnvironment],
-) -> Result<Vec<CondaEnvironment>> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Err(EnvError::Execution(format!(
-            "Environment '{}' matched multiple accessible prefixes and removal requires interactive selection in a terminal:\n{}",
-            name,
-            matches
-                .iter()
-                .map(|environment| environment.prefix.as_str())
-                .collect::<Vec<&str>>()
-                .join("\n")
-        )));
-    }
-
-    println!("{}", render_remove_candidates(name, matches));
-    loop {
-        print!("Selection for '{}': ", name);
-        io::stdout()
-            .flush()
-            .map_err(|error| EnvError::Environment(format!("Failed to flush stdout: {}", error)))?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).map_err(|error| {
-            EnvError::Environment(format!("Failed to read selection: {}", error))
-        })?;
-
-        match parse_remove_selection(&input, matches.len()) {
-            Ok(RemoveSelection::All) => return Ok(matches.to_vec()),
-            Ok(RemoveSelection::Skip) => return Ok(Vec::new()),
-            Ok(RemoveSelection::Indexes(indexes)) => {
-                return Ok(indexes
-                    .into_iter()
-                    .map(|index| matches[index].clone())
-                    .collect())
+    let mut failure_details = Vec::new();
+    for environment_name in parsed_names {
+        info!("Removing conda environment: {}", environment_name);
+        match backend
+            .remove_environment_with_output(&environment_name, output_mode)
+            .await
+        {
+            Ok(()) => {
+                info!("Successfully removed environment {}", environment_name);
             }
             Err(error) => {
-                eprintln!("{}", error);
-            }
-        }
-    }
-}
-
-/// Execute environment removal
-async fn execute_env_remove(names: Vec<String>, verbose: bool) -> Result<()> {
-    let backend = build_default_backend().await?;
-    let all_environments = backend.get_all_conda_environments().await?;
-    let output_mode = execution_output_mode(verbose);
-    let mut removed_prefixes = HashSet::new();
-    let mut failure_details = Vec::new();
-
-    for name in parse_remove_names(&names) {
-        info!("Removing conda environment: {}", name);
-
-        let matches = matching_remove_candidates(&all_environments, &name);
-        if matches.is_empty() {
-            let detail = format!(
-                "{}: environment was not found in accessible environment prefixes",
-                name
-            );
-            error!("{}", detail);
-            failure_details.push(detail);
-            continue;
-        }
-
-        let selected = if matches.len() == 1 {
-            matches
-        } else {
-            select_remove_candidates_interactively(&name, &matches)?
-        };
-
-        if selected.is_empty() {
-            info!("Skipping environment {}", name);
-            continue;
-        }
-
-        for environment in selected {
-            let prefix = environment.prefix.clone();
-            if !removed_prefixes.insert(prefix.clone()) {
-                if verbose {
-                    info!("Skipping already selected prefix {}", prefix);
-                }
-                continue;
-            }
-
-            match backend
-                .remove_environment_by_prefix_with_output(Path::new(&prefix), output_mode)
-                .await
-            {
-                Ok(_) => {
-                    info!(
-                        "Successfully removed environment {} at {}",
-                        environment.name, prefix
-                    );
-                }
-                Err(e) => {
-                    let detail = format!("{} [{}]: {}", environment.name, prefix, e);
-                    error!(
-                        "Failed to remove environment {} at {}: {}",
-                        environment.name, prefix, e
-                    );
-                    failure_details.push(detail);
-                }
+                let detail = format!("{}: {}", environment_name, error);
+                error!(
+                    "Failed to remove environment {}: {}",
+                    environment_name, error
+                );
+                failure_details.push(detail);
             }
         }
     }
@@ -1434,6 +1285,7 @@ fn group_conda_environments(environments: Vec<CondaEnvironment>) -> Vec<GroupedE
 /// showing merged same-name environments and their prefix paths.
 async fn list_all_conda_environments(detailed: bool, json: bool) -> Result<()> {
     let backend = build_default_backend().await?;
+    backend.require_capability(BackendCapability::DiscoverEnvironments)?;
     let grouped = group_conda_environments(backend.get_all_conda_environments().await?);
 
     if json {
@@ -1453,8 +1305,8 @@ async fn list_all_conda_environments(detailed: bool, json: bool) -> Result<()> {
     println!();
     if detailed {
         println!(
-            "{:<30} | {:<10} | {:<12} | {:<12} | {}",
-            "Name", "Owner", "Source", "Adopted From", "Prefix"
+            "{:<30} | {:<10} | {:<12} | {:<12} | Prefix",
+            "Name", "Owner", "Source", "Adopted From"
         );
         println!("{}", "-".repeat(120));
 
@@ -1480,7 +1332,7 @@ async fn list_all_conda_environments(detailed: bool, json: bool) -> Result<()> {
             }
         }
     } else {
-        println!("{:<30} | {:<10} | {}", "Name", "Owner", "Prefixes");
+        println!("{:<30} | {:<10} | Prefixes", "Name", "Owner");
         println!("{}", "-".repeat(120));
 
         for environment in &grouped {
@@ -1510,14 +1362,14 @@ async fn list_all_conda_environments(detailed: bool, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        group_conda_environments, matching_remove_candidates, owner_priority_label,
-        parse_package_specs, parse_remove_names, parse_remove_selection, render_activation_script,
-        render_deactivation_script, render_remove_candidates, render_shell_hook,
-        source_priority_label, ActivationShell, EnvCommand, RemoveSelection,
+        group_conda_environments, owner_priority_label, parse_package_specs, parse_remove_names,
+        render_activation_script, render_deactivation_script, render_shell_hook,
+        source_priority_label, ActivationShell, EnvCommand,
     };
     use crate::micromamba::CondaEnvironment;
     use clap::Parser;
-    use std::path::Path;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
 
     fn environment(
         name: &str,
@@ -1614,14 +1466,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_package_specs_splits_commas_and_discards_empty_values() {
+    fn parse_package_specs_preserves_matchspec_commas_and_discards_empty_values() {
         assert_eq!(
             parse_package_specs(&[
-                "fastqc,multiqc".to_string(),
+                "numpy>=1.24,<2".to_string(),
                 "  ".to_string(),
                 "seqtk".to_string(),
             ]),
-            vec!["fastqc", "multiqc", "seqtk"]
+            vec!["numpy>=1.24,<2", "seqtk"]
         );
     }
 
@@ -1648,96 +1500,117 @@ mod tests {
         let cli = TestCli::try_parse_from(["enva", "remove", "env-a", "env-b"]).unwrap();
 
         match cli.command {
-            EnvCommand::Remove { names } => {
+            EnvCommand::Remove { names, prefix } => {
                 assert_eq!(names, vec!["env-a", "env-b"]);
+                assert_eq!(prefix, None);
             }
             other => panic!("unexpected command parsed: {:?}", other),
         }
     }
 
     #[test]
-    fn matching_remove_candidates_preserves_remove_priority_order() {
-        let matches = matching_remove_candidates(
-            &[
-                environment(
-                    "demo",
-                    "/conda/demo",
-                    false,
-                    Some("external"),
-                    Some("conda"),
-                    None,
-                ),
-                environment(
-                    "demo",
-                    "/micromamba/demo",
-                    true,
-                    Some("external"),
-                    Some("micromamba"),
-                    None,
-                ),
-                environment(
-                    "demo",
-                    "/rattler/demo",
-                    false,
-                    Some("rattler"),
-                    Some("rattler"),
-                    None,
-                ),
-            ],
-            "demo",
-        );
+    fn remove_command_accepts_explicit_prefix_without_name() {
+        let cli = TestCli::try_parse_from(["enva", "remove", "--prefix", "/opt/conda/envs/demo"])
+            .unwrap();
 
-        assert_eq!(
-            matches
-                .iter()
-                .map(|environment| environment.prefix.as_str())
-                .collect::<Vec<&str>>(),
-            vec!["/rattler/demo", "/micromamba/demo", "/conda/demo"]
-        );
+        match cli.command {
+            EnvCommand::Remove { names, prefix } => {
+                assert!(names.is_empty());
+                assert_eq!(prefix, Some(PathBuf::from("/opt/conda/envs/demo")));
+            }
+            other => panic!("unexpected command parsed: {:?}", other),
+        }
     }
 
     #[test]
-    fn parse_remove_selection_supports_all_skip_and_multiple_indexes() {
-        assert_eq!(
-            parse_remove_selection("1, 3 2", 3).unwrap(),
-            RemoveSelection::Indexes(vec![0, 2, 1])
-        );
-        assert_eq!(
-            parse_remove_selection("all", 3).unwrap(),
-            RemoveSelection::All
-        );
-        assert_eq!(
-            parse_remove_selection("skip", 3).unwrap(),
-            RemoveSelection::Skip
-        );
+    fn install_command_accepts_explicit_prefix() {
+        let cli = TestCli::try_parse_from([
+            "enva",
+            "install",
+            "seqtk",
+            "--prefix",
+            "/opt/conda/envs/demo",
+        ])
+        .unwrap();
+
+        match cli.command {
+            EnvCommand::Install(arguments) => {
+                assert_eq!(arguments.packages, vec!["seqtk"]);
+                assert_eq!(
+                    arguments.prefix,
+                    Some(PathBuf::from("/opt/conda/envs/demo"))
+                );
+                assert_eq!(arguments.name, None);
+            }
+            other => panic!("unexpected command parsed: {:?}", other),
+        }
     }
 
     #[test]
-    fn parse_remove_selection_rejects_out_of_range_indexes() {
-        assert!(parse_remove_selection("0", 2).is_err());
-        assert!(parse_remove_selection("3", 2).is_err());
+    fn run_command_parser_preserves_argv_boundaries_after_separator() {
+        let cli = TestCli::try_parse_from([
+            "enva",
+            "run",
+            "test-env",
+            "--",
+            "tool",
+            "value with spaces",
+            "semi;colon",
+            "$(printf injected)",
+            "*.fastq.gz",
+            "line one\nline two",
+            "-leading-option",
+        ])
+        .unwrap();
+
+        match cli.command {
+            EnvCommand::Run(arguments) => {
+                assert_eq!(
+                    arguments.args,
+                    vec![
+                        OsString::from("test-env"),
+                        OsString::from("tool"),
+                        OsString::from("value with spaces"),
+                        OsString::from("semi;colon"),
+                        OsString::from("$(printf injected)"),
+                        OsString::from("*.fastq.gz"),
+                        OsString::from("line one\nline two"),
+                        OsString::from("-leading-option"),
+                    ]
+                );
+            }
+            other => panic!("unexpected command parsed: {:?}", other),
+        }
     }
 
     #[test]
-    fn render_remove_candidates_includes_source_owner_and_active_details() {
-        let output = render_remove_candidates(
-            "demo",
-            &[environment(
-                "demo",
-                "/micromamba/demo",
-                true,
-                Some("external"),
-                Some("micromamba"),
-                Some("conda"),
-            )],
-        );
+    fn run_command_parser_allows_script_option_after_environment_name() {
+        let cli = TestCli::try_parse_from([
+            "enva",
+            "run",
+            "test-env",
+            "--script",
+            "analysis script.R",
+            "--",
+            "value with spaces",
+            "-leading-option",
+        ])
+        .unwrap();
 
-        assert!(output.contains("Environment 'demo' matched multiple accessible prefixes"));
-        assert!(output.contains("/micromamba/demo"));
-        assert!(output.contains("owner=external"));
-        assert!(output.contains("source=micromamba"));
-        assert!(output.contains("adopted_from=conda"));
-        assert!(output.contains("active"));
+        match cli.command {
+            EnvCommand::Run(arguments) => {
+                assert_eq!(arguments.script, Some(PathBuf::from("analysis script.R")));
+                assert_eq!(
+                    arguments.args,
+                    vec![
+                        OsString::from("test-env"),
+                        OsString::from("value with spaces"),
+                        OsString::from("-leading-option"),
+                    ]
+                );
+            }
+            other => panic!("unexpected command parsed: {:?}", other),
+        }
     }
 
     #[test]

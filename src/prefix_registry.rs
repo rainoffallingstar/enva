@@ -3,7 +3,8 @@ use crate::micromamba::{CondaEnvironment, MicromambaManager};
 use crate::ownership::read_ownership_record;
 use crate::package_manager::{PackageManager, PackageManagerDetector};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,11 +59,9 @@ impl DiscoveredEnvironment {
     pub fn from_conda_environment(
         package_manager: PackageManager,
         environment: CondaEnvironment,
-    ) -> Self {
+    ) -> Result<Self> {
         let source = EnvironmentSource::PackageManager(package_manager);
-        let ownership_record = read_ownership_record(PathBuf::from(&environment.prefix).as_path())
-            .ok()
-            .flatten();
+        let ownership_record = read_ownership_record(PathBuf::from(&environment.prefix).as_path())?;
         let owner = ownership_record
             .as_ref()
             .filter(|record| record.is_rattler_owned())
@@ -77,14 +76,14 @@ impl DiscoveredEnvironment {
                 EnvironmentOwner::External => None,
             });
 
-        Self {
+        Ok(Self {
             name: environment.name,
             prefix: PathBuf::from(environment.prefix),
             is_active: environment.is_active,
             source,
             owner,
             adopted_from,
-        }
+        })
     }
 
     pub fn rattler_managed(&self) -> bool {
@@ -129,9 +128,12 @@ pub async fn discover_cli_environments() -> Result<Vec<DiscoveredEnvironment>> {
             }
         };
 
-        environments.extend(discovered.into_iter().map(|environment| {
-            DiscoveredEnvironment::from_conda_environment(package_manager, environment)
-        }));
+        for environment in discovered {
+            environments.push(DiscoveredEnvironment::from_conda_environment(
+                package_manager,
+                environment,
+            )?);
+        }
     }
 
     Ok(dedupe_discovered_environments(environments))
@@ -155,6 +157,10 @@ fn environment_priority(environment: &DiscoveredEnvironment) -> (u8, u8, String)
     )
 }
 
+fn canonical_environment_identity(prefix: &Path) -> PathBuf {
+    fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf())
+}
+
 pub fn dedupe_discovered_environments(
     environments: impl IntoIterator<Item = DiscoveredEnvironment>,
 ) -> Vec<DiscoveredEnvironment> {
@@ -165,7 +171,7 @@ pub fn dedupe_discovered_environments(
             continue;
         }
 
-        let key = environment.prefix.clone();
+        let key = canonical_environment_identity(&environment.prefix);
         match deduped.get(&key) {
             Some(existing)
                 if environment_priority(existing) <= environment_priority(&environment) => {}
@@ -192,7 +198,26 @@ mod tests {
         EnvironmentOwner, EnvironmentSource,
     };
     use crate::package_manager::PackageManager;
+    use std::fs;
     use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    fn environment_at(
+        name: &str,
+        prefix: PathBuf,
+        source: EnvironmentSource,
+        owner: EnvironmentOwner,
+        adopted_from: Option<EnvironmentSource>,
+    ) -> DiscoveredEnvironment {
+        DiscoveredEnvironment {
+            name: name.to_string(),
+            prefix,
+            is_active: false,
+            source,
+            owner,
+            adopted_from,
+        }
+    }
 
     fn environment(
         name: &str,
@@ -201,14 +226,7 @@ mod tests {
         owner: EnvironmentOwner,
         adopted_from: Option<EnvironmentSource>,
     ) -> DiscoveredEnvironment {
-        DiscoveredEnvironment {
-            name: name.to_string(),
-            prefix: PathBuf::from(prefix),
-            is_active: false,
-            source,
-            owner,
-            adopted_from,
-        }
+        environment_at(name, PathBuf::from(prefix), source, owner, adopted_from)
     }
 
     #[test]
@@ -232,6 +250,67 @@ mod tests {
 
         assert_eq!(environments.len(), 1);
         assert_eq!(environments[0].owner, EnvironmentOwner::Rattler);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dedupe_discovered_environments_collapses_symlink_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let temporary_directory = tempdir().unwrap();
+        let real_prefix = temporary_directory.path().join("real-prefix");
+        let alias_prefix = temporary_directory.path().join("alias-prefix");
+        fs::create_dir_all(&real_prefix).unwrap();
+        symlink(&real_prefix, &alias_prefix).unwrap();
+
+        let environments = dedupe_discovered_environments(vec![
+            environment_at(
+                "demo",
+                alias_prefix,
+                EnvironmentSource::PackageManager(PackageManager::Conda),
+                EnvironmentOwner::External,
+                None,
+            ),
+            environment_at(
+                "demo",
+                real_prefix.clone(),
+                EnvironmentSource::Rattler,
+                EnvironmentOwner::Rattler,
+                None,
+            ),
+        ]);
+
+        assert_eq!(environments.len(), 1);
+        assert_eq!(environments[0].prefix, real_prefix);
+        assert_eq!(environments[0].owner, EnvironmentOwner::Rattler);
+    }
+
+    #[test]
+    fn dedupe_discovered_environments_preserves_distinct_same_name_prefixes() {
+        let temporary_directory = tempdir().unwrap();
+        let first_prefix = temporary_directory.path().join("first").join("demo");
+        let second_prefix = temporary_directory.path().join("second").join("demo");
+        fs::create_dir_all(&first_prefix).unwrap();
+        fs::create_dir_all(&second_prefix).unwrap();
+
+        let environments = dedupe_discovered_environments(vec![
+            environment_at(
+                "demo",
+                first_prefix,
+                EnvironmentSource::Rattler,
+                EnvironmentOwner::Rattler,
+                None,
+            ),
+            environment_at(
+                "demo",
+                second_prefix,
+                EnvironmentSource::PackageManager(PackageManager::Conda),
+                EnvironmentOwner::External,
+                None,
+            ),
+        ]);
+
+        assert_eq!(environments.len(), 2);
     }
 
     #[test]

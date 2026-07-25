@@ -4,9 +4,10 @@
 //! (`micromamba`, `mamba`, `conda`) for compatibility scenarios such as
 //! environment discovery, adoption, and explicit fallback flows.
 
-use crate::error::Result;
+use crate::error::{EnvError, Result};
 use clap::ValueEnum;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use tracing::{debug, info, warn};
@@ -74,6 +75,12 @@ fn availability_cache() -> &'static Mutex<HashMap<PackageManager, bool>> {
 pub struct PackageManagerDetector {
     detected: Option<PackageManager>,
     detection_order: Vec<PackageManager>,
+}
+
+impl Default for PackageManagerDetector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PackageManagerDetector {
@@ -153,42 +160,54 @@ impl PackageManagerDetector {
         Ok(PackageManager::None)
     }
 
+    fn configured_command_path(&self, package_manager: &PackageManager) -> Option<PathBuf> {
+        if *package_manager == PackageManager::Micromamba {
+            if let Some(configured_path) =
+                std::env::var_os("ENVA_MICROMAMBA_PATH").filter(|value| !value.is_empty())
+            {
+                return Some(PathBuf::from(configured_path));
+            }
+        }
+
+        which(package_manager.command()).ok()
+    }
+
     /// Check if PM is available and functional
-    fn check_available(&self, pm: &PackageManager) -> bool {
+    fn check_available(&self, package_manager: &PackageManager) -> bool {
         if let Ok(cache) = availability_cache().lock() {
-            if let Some(available) = cache.get(pm) {
+            if let Some(available) = cache.get(package_manager) {
                 return *available;
             }
         }
 
-        let cmd = pm.command();
-        let available = match which(cmd) {
-            Ok(path) => match Command::new(&path).arg("--version").output() {
+        let command_name = package_manager.command();
+        let available = match self.configured_command_path(package_manager) {
+            Some(path) => match Command::new(&path).arg("--version").output() {
                 Ok(output) if output.status.success() => {
-                    debug!("{} is available at {}", cmd, path.display());
+                    debug!("{} is available at {}", command_name, path.display());
                     true
                 }
                 Ok(output) => {
                     debug!(
                         "{} failed health check with status {:?}",
-                        cmd,
+                        command_name,
                         output.status.code()
                     );
                     false
                 }
                 Err(error) => {
-                    debug!("{} failed health check: {}", cmd, error);
+                    debug!("{} failed health check: {}", command_name, error);
                     false
                 }
             },
-            Err(_) => {
-                debug!("{} not found in PATH", cmd);
+            None => {
+                debug!("{} not found in PATH", command_name);
                 false
             }
         };
 
         if let Ok(mut cache) = availability_cache().lock() {
-            cache.insert(*pm, available);
+            cache.insert(*package_manager, available);
         }
 
         available
@@ -239,11 +258,15 @@ impl PackageManagerDetector {
             return Ok(pm);
         }
 
-        warn!(
-            "Package manager '{}' not found, falling back to auto-detection",
-            pm
-        );
-        self.detect()
+        Err(EnvError::Config(format!(
+            "Explicitly selected compatibility package manager '{}' is unavailable. Install it and add it to PATH{}.",
+            pm,
+            if pm == PackageManager::Micromamba {
+                ", or set ENVA_MICROMAMBA_PATH to its executable"
+            } else {
+                ""
+            }
+        )))
     }
 }
 

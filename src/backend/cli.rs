@@ -1,4 +1,6 @@
-use super::{BackendKind, EnvironmentBackend, EnvironmentTarget, OutputMode, RunRequest};
+use super::{
+    BackendCapabilities, BackendKind, EnvironmentBackend, EnvironmentTarget, OutputMode, RunRequest,
+};
 use crate::error::{EnvError, Result};
 use crate::micromamba::{CondaEnvironment, MicromambaManager, ValidationResult};
 use crate::package_manager::PackageManager;
@@ -46,6 +48,10 @@ impl EnvironmentBackend for CliBackend {
         BackendKind::Cli
     }
 
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::cli_compatibility()
+    }
+
     async fn clean_package_cache(&self, dry_run: bool, output_mode: OutputMode) -> Result<()> {
         let manager = self.runtime_manager().await?;
         manager.clean_package_cache(dry_run, output_mode).await
@@ -85,6 +91,27 @@ impl EnvironmentBackend for CliBackend {
         manager
             .install_packages(env_name, packages, output_mode)
             .await
+    }
+
+    async fn install_packages_for_target(
+        &self,
+        target: &EnvironmentTarget,
+        packages: &[String],
+        output_mode: OutputMode,
+    ) -> Result<()> {
+        let manager = self.runtime_manager().await?;
+        match target {
+            EnvironmentTarget::Name(env_name) => {
+                manager
+                    .install_packages(env_name, packages, output_mode)
+                    .await
+            }
+            EnvironmentTarget::Prefix(prefix) => {
+                manager
+                    .install_packages_by_prefix(prefix, packages, output_mode)
+                    .await
+            }
+        }
     }
 
     async fn adopt_environment(

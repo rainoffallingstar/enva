@@ -144,6 +144,103 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  compatibility-backend-smoke:
+    name: Compatibility smoke (${{ matrix.manager }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        manager: [micromamba, mamba, conda]
+    env:
+      CARGO_TERM_COLOR: always
+      ENVA_BACKEND: cli
+      ENVA_PACKAGE_MANAGER: ${{ matrix.manager }}
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up micromamba
+        if: matrix.manager == 'micromamba'
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          generate-run-shell: false
+
+      - name: Set up mamba
+        if: matrix.manager == 'mamba'
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          mamba-version: "*"
+          channels: conda-forge
+          channel-priority: strict
+          activate-environment: ""
+          auto-activate-base: false
+
+      - name: Set up conda
+        if: matrix.manager == 'conda'
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniconda-version: latest
+          activate-environment: ""
+          auto-activate-base: false
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Exercise installed compatibility backend
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          manager="${{ matrix.manager }}"
+          environment_name="enva-${manager}-compat-ci"
+          mkdir -p ci-logs
+          "$manager" --version | tee "ci-logs/${manager}-version.log"
+          cat > "${RUNNER_TEMP}/compat-environment.yaml" <<'YAML'
+          channels:
+            - conda-forge
+          dependencies:
+            - python=3.11
+          YAML
+          cargo build --release --bin enva
+          ./target/release/enva create \
+            --yaml "${RUNNER_TEMP}/compat-environment.yaml" \
+            --name "$environment_name" \
+            --force \
+            --output summary \
+            2>&1 | tee "ci-logs/${manager}-create.log"
+          ./target/release/enva list --detailed \
+            2>&1 | tee "ci-logs/${manager}-list.log"
+          grep -q "$environment_name" "ci-logs/${manager}-list.log"
+          ./target/release/enva install --name "$environment_name" conda-forge::jq \
+            2>&1 | tee "ci-logs/${manager}-install.log"
+          ./target/release/enva run \
+            --name "$environment_name" \
+            --command 'python -c "import sys; print(sys.prefix)" && jq --version' \
+            2>&1 | tee "ci-logs/${manager}-run.log"
+          ./target/release/enva remove "$environment_name" \
+            2>&1 | tee "ci-logs/${manager}-remove.log"
+          if ./target/release/enva list --detailed | grep -q "$environment_name"; then
+            echo "Compatibility backend still reports $environment_name after removal" >&2
+            exit 1
+          fi
+
+      - name: Upload compatibility smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enva-compat-${{ matrix.manager }}-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
   adopt-e2e:
     name: E2E adopt-helper-path
     runs-on: ubuntu-latest

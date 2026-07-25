@@ -52,6 +52,9 @@ pub enum EnvError {
     #[error("Process spawn error: {0}")]
     ProcessSpawn(String),
 
+    #[error("Command failed with exit code {code:?}")]
+    ProcessExit { code: Option<i32> },
+
     #[error("Execution error: {0}")]
     Execution(String),
 

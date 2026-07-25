@@ -1,6 +1,10 @@
-use super::{BackendKind, EnvironmentBackend, EnvironmentTarget, OutputMode, RunRequest};
+use super::{
+    build_environment_run_command, BackendCapabilities, BackendKind, EnvironmentBackend,
+    EnvironmentName, EnvironmentTarget, OutputMode, RunRequest,
+};
 use crate::error::{EnvError, Result};
 use crate::micromamba::{CondaEnvironment, MicromambaManager, ValidationDetails, ValidationResult};
+use crate::operation_lock::{LockOperation, OperationLock};
 use crate::ownership::{
     ownership_record_path, read_ownership_record, write_rattler_ownership_record,
 };
@@ -9,6 +13,7 @@ use crate::prefix_registry::{
     discover_cli_environments, merge_discovered_environments, DiscoveredEnvironment,
     EnvironmentOwner, EnvironmentSource,
 };
+use crate::staged_prefix::StagedPrefix;
 use async_trait::async_trait;
 use indicatif::{ProgressBar, ProgressStyle};
 use rattler::install::Installer;
@@ -19,21 +24,386 @@ use rattler_conda_types::{
 use rattler_repodata_gateway::{Gateway, RepoData};
 use rattler_solve::{resolvo::Solver as RattlerSolver, ChannelPriority, SolverImpl, SolverTask};
 use rattler_virtual_packages::{VirtualPackage, VirtualPackageOverrides};
-use std::collections::{BTreeSet, HashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs as async_fs;
-use tokio::process::Command as AsyncCommand;
-use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct RattlerBackend {
     root_prefixes: Vec<PathBuf>,
-    creation_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CondaPrefixLayout {
+    BaseRoot(PathBuf),
+    ManagedEnvironment {
+        root_prefix: PathBuf,
+        prefix: PathBuf,
+    },
+    ExternalEnvironment(PathBuf),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PrefixCloneResult {
+    pub files_copied: u64,
+    pub bytes_copied: u64,
+    pub hard_links_preserved: u64,
+    pub symlinks_copied: u64,
+    pub elapsed_millis: u128,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PrefixRelocationResult {
+    pub files_rewritten: u64,
+    pub bytes_rewritten: u64,
+    pub symlinks_rewritten: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheOwnershipMarker {
+    version: u8,
+    cache_root: PathBuf,
+    owner: String,
+}
+
+fn path_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().as_bytes().to_vec()
+    }
+}
+
+fn io_error(operation: &str, path: &Path, error: io::Error) -> EnvError {
+    EnvError::FileOperation(format!("{} {}: {}", operation, path.display(), error))
+}
+
+fn ensure_symlink_stays_inside(
+    source_root: &Path,
+    link_path: &Path,
+    target: &Path,
+) -> Result<PathBuf> {
+    let resolved_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link_path.parent().unwrap_or(source_root).join(target)
+    };
+    let canonical_root = fs::canonicalize(source_root)
+        .map_err(|error| io_error("Failed to canonicalize source prefix", source_root, error))?;
+    let canonical_target = fs::canonicalize(&resolved_target).map_err(|error| {
+        EnvError::Validation(format!(
+            "Cannot safely clone dangling symlink {} -> {}: {}",
+            link_path.display(),
+            target.display(),
+            error
+        ))
+    })?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(EnvError::PermissionDenied(format!(
+            "Refusing to clone symlink escaping source prefix: {} -> {}",
+            link_path.display(),
+            target.display()
+        )));
+    }
+    Ok(canonical_target)
+}
+
+#[cfg(unix)]
+fn hard_link_identity(metadata: &fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    Some(format!("{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn hard_link_identity(_metadata: &fs::Metadata) -> Option<String> {
+    None
+}
+
+fn copy_prefix_entry(
+    source_root: &Path,
+    destination_root: &Path,
+    source_path: &Path,
+    destination_path: &Path,
+    result: &mut PrefixCloneResult,
+    hard_links: &mut HashMap<String, PathBuf>,
+    use_reflinks: bool,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(source_path)
+        .map_err(|error| io_error("Failed to inspect", source_path, error))?;
+    let file_type = metadata.file_type();
+
+    if file_type.is_symlink() {
+        let target = fs::read_link(source_path)
+            .map_err(|error| io_error("Failed to read symlink", source_path, error))?;
+        let canonical_target = ensure_symlink_stays_inside(source_root, source_path, &target)?;
+        let relative_target = canonical_target
+            .strip_prefix(fs::canonicalize(source_root).map_err(|error| {
+                io_error("Failed to canonicalize source prefix", source_root, error)
+            })?)
+            .map_err(|_| {
+                EnvError::PermissionDenied(format!(
+                    "Symlink target escaped source prefix: {}",
+                    source_path.display()
+                ))
+            })?;
+        let destination_target = if target.is_absolute() {
+            destination_root.join(relative_target)
+        } else {
+            target.clone()
+        };
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&destination_target, destination_path)
+            .map_err(|error| io_error("Failed to clone symlink", destination_path, error))?;
+        #[cfg(windows)]
+        {
+            let target_is_directory = canonical_target.is_dir();
+            if target_is_directory {
+                std::os::windows::fs::symlink_dir(&destination_target, destination_path).map_err(
+                    |error| io_error("Failed to clone directory symlink", destination_path, error),
+                )?;
+            } else {
+                std::os::windows::fs::symlink_file(&destination_target, destination_path).map_err(
+                    |error| io_error("Failed to clone file symlink", destination_path, error),
+                )?;
+            }
+        }
+        result.symlinks_copied += 1;
+        return Ok(());
+    }
+
+    if file_type.is_dir() {
+        fs::create_dir(destination_path)
+            .map_err(|error| io_error("Failed to create directory", destination_path, error))?;
+        for entry in fs::read_dir(source_path)
+            .map_err(|error| io_error("Failed to read directory", source_path, error))?
+        {
+            let entry = entry
+                .map_err(|error| io_error("Failed to read directory entry", source_path, error))?;
+            copy_prefix_entry(
+                source_root,
+                destination_root,
+                &entry.path(),
+                &destination_path.join(entry.file_name()),
+                result,
+                hard_links,
+                use_reflinks,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if !file_type.is_file() {
+        return Err(EnvError::Validation(format!(
+            "Unsupported prefix entry type: {}",
+            source_path.display()
+        )));
+    }
+
+    if let Some(identity) = hard_link_identity(&metadata) {
+        if let Some(existing_destination) = hard_links.get(&identity) {
+            fs::hard_link(existing_destination, destination_path).map_err(|error| {
+                io_error(
+                    "Failed to preserve internal hard link",
+                    destination_path,
+                    error,
+                )
+            })?;
+            result.hard_links_preserved += 1;
+            result.files_copied += 1;
+            result.bytes_copied += metadata.len();
+            return Ok(());
+        }
+        hard_links.insert(identity, destination_path.to_path_buf());
+    }
+
+    let copied_bytes = if use_reflinks {
+        reflink_copy::reflink_or_copy(source_path, destination_path)
+            .map_err(|error| io_error("Failed to copy prefix file", destination_path, error))?
+            .unwrap_or(metadata.len())
+    } else {
+        fs::copy(source_path, destination_path)
+            .map_err(|error| io_error("Failed to copy prefix file", destination_path, error))?
+    };
+    result.files_copied += 1;
+    result.bytes_copied += copied_bytes;
+    Ok(())
+}
+
+fn clone_prefix_with_copy_mode(
+    source: &Path,
+    destination: &Path,
+    use_reflinks: bool,
+) -> Result<PrefixCloneResult> {
+    let started_at = Instant::now();
+    let source_metadata = fs::symlink_metadata(source)
+        .map_err(|error| io_error("Failed to inspect source prefix", source, error))?;
+    if !source_metadata.is_dir() || source_metadata.file_type().is_symlink() {
+        return Err(EnvError::Validation(format!(
+            "Source prefix must be a real directory: {}",
+            source.display()
+        )));
+    }
+    if destination.exists() {
+        let destination_metadata = fs::symlink_metadata(destination).map_err(|error| {
+            io_error("Failed to inspect destination prefix", destination, error)
+        })?;
+        if !destination_metadata.is_dir() || destination_metadata.file_type().is_symlink() {
+            return Err(EnvError::Validation(format!(
+                "Destination staging prefix must be a real directory: {}",
+                destination.display()
+            )));
+        }
+    } else {
+        fs::create_dir_all(destination)
+            .map_err(|error| io_error("Failed to create destination prefix", destination, error))?;
+    }
+
+    let mut result = PrefixCloneResult::default();
+    let mut hard_links = HashMap::new();
+    for entry in fs::read_dir(source)
+        .map_err(|error| io_error("Failed to read source prefix", source, error))?
+    {
+        let entry =
+            entry.map_err(|error| io_error("Failed to read source prefix entry", source, error))?;
+        copy_prefix_entry(
+            source,
+            destination,
+            &entry.path(),
+            &destination.join(entry.file_name()),
+            &mut result,
+            &mut hard_links,
+            use_reflinks,
+        )?;
+    }
+    result.elapsed_millis = started_at.elapsed().as_millis();
+    Ok(result)
+}
+
+pub fn clone_prefix_for_staging(source: &Path, destination: &Path) -> Result<PrefixCloneResult> {
+    clone_prefix_with_copy_mode(source, destination, true)
+}
+
+fn clone_prefix_without_reflinks(source: &Path, destination: &Path) -> Result<PrefixCloneResult> {
+    clone_prefix_with_copy_mode(source, destination, false)
+}
+
+fn replace_all_bytes(input: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(relative) = input[cursor..]
+        .windows(from.len())
+        .position(|window| window == from)
+    {
+        let match_start = cursor + relative;
+        output.extend_from_slice(&input[cursor..match_start]);
+        output.extend_from_slice(to);
+        cursor = match_start + from.len();
+    }
+    output.extend_from_slice(&input[cursor..]);
+    output
+}
+
+fn sweep_relocation_entries(
+    root: &Path,
+    staging_prefix: &[u8],
+    final_prefix: &[u8],
+    result: &mut PrefixRelocationResult,
+) -> Result<()> {
+    for entry in fs::read_dir(root)
+        .map_err(|error| io_error("Failed to read relocation directory", root, error))?
+    {
+        let entry =
+            entry.map_err(|error| io_error("Failed to read relocation entry", root, error))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| io_error("Failed to inspect relocation entry", &path, error))?;
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&path)
+                .map_err(|error| io_error("Failed to read relocation symlink", &path, error))?;
+            let target_bytes = path_bytes(&target);
+            if target_bytes
+                .windows(staging_prefix.len())
+                .any(|window| window == staging_prefix)
+            {
+                let replaced = replace_all_bytes(&target_bytes, staging_prefix, final_prefix);
+                let replaced_target = String::from_utf8(replaced).map_err(|_| {
+                    EnvError::Validation(format!(
+                        "Binary symlink target contains staging prefix: {}",
+                        path.display()
+                    ))
+                })?;
+                fs::remove_file(&path).map_err(|error| {
+                    io_error("Failed to replace relocation symlink", &path, error)
+                })?;
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(replaced_target, &path)
+                    .map_err(|error| io_error("Failed to write relocated symlink", &path, error))?;
+                #[cfg(windows)]
+                return Err(EnvError::Validation(
+                    "Relocation of absolute symlinks is unsupported on Windows".to_string(),
+                ));
+                result.symlinks_rewritten += 1;
+            }
+            continue;
+        }
+        if metadata.is_dir() {
+            sweep_relocation_entries(&path, staging_prefix, final_prefix, result)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let content = fs::read(&path)
+            .map_err(|error| io_error("Failed to read relocation file", &path, error))?;
+        if !content
+            .windows(staging_prefix.len())
+            .any(|window| window == staging_prefix)
+        {
+            continue;
+        }
+        if content.contains(&0) || std::str::from_utf8(&content).is_err() {
+            return Err(EnvError::Validation(format!(
+                "Binary file contains staging prefix residual: {}",
+                path.display()
+            )));
+        }
+        let replaced = replace_all_bytes(&content, staging_prefix, final_prefix);
+        fs::write(&path, &replaced)
+            .map_err(|error| io_error("Failed to write relocated file", &path, error))?;
+        result.files_rewritten += 1;
+        result.bytes_rewritten += replaced.len() as u64;
+    }
+    Ok(())
+}
+
+pub fn relocate_cloned_prefix(
+    staging_prefix: &Path,
+    final_prefix: &Path,
+) -> Result<PrefixRelocationResult> {
+    let staging_bytes = path_bytes(staging_prefix);
+    let final_bytes = path_bytes(final_prefix);
+    if staging_bytes.is_empty() {
+        return Err(EnvError::Validation(
+            "Staging prefix must not be empty".to_string(),
+        ));
+    }
+    let mut result = PrefixRelocationResult::default();
+    sweep_relocation_entries(staging_prefix, &staging_bytes, &final_bytes, &mut result)?;
+    Ok(result)
+}
+
+pub fn benchmark_prefix_clone(source: &Path, destination: &Path) -> Result<PrefixCloneResult> {
+    clone_prefix_without_reflinks(source, destination)
 }
 
 impl Default for RattlerBackend {
@@ -46,14 +416,12 @@ impl RattlerBackend {
     pub fn new() -> Self {
         Self {
             root_prefixes: Self::detect_root_prefixes(),
-            creation_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub fn with_root_prefixes(root_prefixes: Vec<PathBuf>) -> Self {
         Self {
             root_prefixes: Self::dedupe_paths(root_prefixes),
-            creation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -71,16 +439,15 @@ impl RattlerBackend {
         }
 
         if let Some(conda_prefix) = std::env::var_os("CONDA_PREFIX").map(PathBuf::from) {
-            if let Some(parent) = conda_prefix.parent() {
-                if parent.file_name().and_then(|name| name.to_str()) == Some("envs") {
-                    if let Some(root_prefix) = parent.parent() {
-                        candidates.push(root_prefix.to_path_buf());
-                    }
-                } else {
-                    candidates.push(conda_prefix);
+            let default_environment = std::env::var("CONDA_DEFAULT_ENV").ok();
+            if let Some(root_prefix) =
+                match Self::classify_conda_prefix(&conda_prefix, default_environment.as_deref()) {
+                    CondaPrefixLayout::BaseRoot(root_prefix) => Some(root_prefix),
+                    CondaPrefixLayout::ManagedEnvironment { root_prefix, .. } => Some(root_prefix),
+                    CondaPrefixLayout::ExternalEnvironment(_) => None,
                 }
-            } else {
-                candidates.push(conda_prefix);
+            {
+                candidates.push(root_prefix);
             }
         }
 
@@ -124,14 +491,117 @@ impl RattlerBackend {
             .unwrap_or_else(Self::default_root_prefix)
     }
 
-    fn target_prefix_for_env_name(&self, env_name: &str) -> Result<PathBuf> {
-        if env_name == "base" {
-            return Err(EnvError::Validation(
-                "rattler backend does not support creating the base environment".to_string(),
-            ));
+    pub fn classify_conda_prefix(
+        prefix: &Path,
+        default_environment: Option<&str>,
+    ) -> CondaPrefixLayout {
+        if !prefix.is_absolute() {
+            return CondaPrefixLayout::ExternalEnvironment(prefix.to_path_buf());
         }
 
-        Ok(self.preferred_root_prefix().join("envs").join(env_name))
+        if default_environment
+            .map(|environment| environment.eq_ignore_ascii_case("base"))
+            .unwrap_or(false)
+        {
+            return CondaPrefixLayout::BaseRoot(prefix.to_path_buf());
+        }
+
+        let Some(envs_directory) = prefix.parent() else {
+            return CondaPrefixLayout::ExternalEnvironment(prefix.to_path_buf());
+        };
+        if envs_directory.file_name().and_then(|name| name.to_str()) != Some("envs") {
+            return CondaPrefixLayout::ExternalEnvironment(prefix.to_path_buf());
+        }
+
+        let Some(root_prefix) = envs_directory.parent() else {
+            return CondaPrefixLayout::ExternalEnvironment(prefix.to_path_buf());
+        };
+        CondaPrefixLayout::ManagedEnvironment {
+            root_prefix: root_prefix.to_path_buf(),
+            prefix: prefix.to_path_buf(),
+        }
+    }
+
+    fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
+        if path.is_absolute() {
+            fs::canonicalize(path).or_else(|error| {
+                let parent = path.parent().ok_or_else(|| {
+                    EnvError::FileOperation(format!("Path has no parent: {}", path.display()))
+                })?;
+                let canonical_parent = fs::canonicalize(parent).map_err(|parent_error| {
+                    EnvError::FileOperation(format!(
+                        "Failed to canonicalize {}: {}; original error: {}",
+                        parent.display(),
+                        parent_error,
+                        error
+                    ))
+                })?;
+                Ok(canonical_parent.join(path.file_name().ok_or_else(|| {
+                    EnvError::Validation(format!("Path has no file name: {}", path.display()))
+                })?))
+            })
+        } else {
+            Err(EnvError::Validation(format!(
+                "Environment paths must be absolute: {}",
+                path.display()
+            )))
+        }
+    }
+
+    fn validated_environment_prefix(&self, env_name: &str) -> Result<PathBuf> {
+        let environment_name = EnvironmentName::parse(env_name.to_string())?;
+        let root_prefix = Self::canonical_or_absolute(&self.preferred_root_prefix())?;
+        let environments_directory = root_prefix.join("envs");
+        fs::create_dir_all(&environments_directory).map_err(|error| {
+            EnvError::FileOperation(format!(
+                "Failed to create rattler environment directory {}: {}",
+                environments_directory.display(),
+                error
+            ))
+        })?;
+        let canonical_environments_directory =
+            fs::canonicalize(&environments_directory).map_err(|error| {
+                EnvError::FileOperation(format!(
+                    "Failed to canonicalize rattler environment directory {}: {}",
+                    environments_directory.display(),
+                    error
+                ))
+            })?;
+        let target = canonical_environments_directory.join(environment_name.as_str());
+        if target.parent() != Some(canonical_environments_directory.as_path()) {
+            return Err(EnvError::PermissionDenied(format!(
+                "Environment target escaped rattler envs directory: {}",
+                target.display()
+            )));
+        }
+        Ok(target)
+    }
+
+    fn prefix_lock_path(prefix: &Path) -> Result<PathBuf> {
+        let parent = prefix.parent().ok_or_else(|| {
+            EnvError::Lock(format!(
+                "Environment prefix has no parent: {}",
+                prefix.display()
+            ))
+        })?;
+        let name = prefix
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                EnvError::Lock(format!(
+                    "Environment prefix has no safe name: {}",
+                    prefix.display()
+                ))
+            })?;
+        Ok(parent.join(format!(".enva-{}-operation.lock", name)))
+    }
+
+    async fn acquire_prefix_lock(prefix: &Path, operation: LockOperation) -> Result<OperationLock> {
+        OperationLock::acquire(Self::prefix_lock_path(prefix)?, operation).await
+    }
+
+    fn target_prefix_for_env_name(&self, env_name: &str) -> Result<PathBuf> {
+        self.validated_environment_prefix(env_name)
     }
 
     fn parse_environment_yaml(yaml_file: &Path) -> Result<EnvironmentYaml> {
@@ -394,46 +864,6 @@ impl RattlerBackend {
             .collect()
     }
 
-    fn stash_ownership_marker(prefix: &Path) -> Result<Option<String>> {
-        let marker_path = ownership_record_path(prefix);
-        if !marker_path.is_file() {
-            return Ok(None);
-        }
-
-        let contents = fs::read_to_string(&marker_path).map_err(|error| {
-            EnvError::FileOperation(format!(
-                "Failed to read ownership marker {}: {}",
-                marker_path.display(),
-                error
-            ))
-        })?;
-
-        fs::remove_file(&marker_path).map_err(|error| {
-            EnvError::FileOperation(format!(
-                "Failed to temporarily remove ownership marker {}: {}",
-                marker_path.display(),
-                error
-            ))
-        })?;
-
-        Ok(Some(contents))
-    }
-
-    fn restore_ownership_marker(prefix: &Path, contents: Option<String>) -> Result<()> {
-        let Some(contents) = contents else {
-            return Ok(());
-        };
-
-        let marker_path = ownership_record_path(prefix);
-        fs::write(&marker_path, contents).map_err(|error| {
-            EnvError::FileOperation(format!(
-                "Failed to restore ownership marker {}: {}",
-                marker_path.display(),
-                error
-            ))
-        })
-    }
-
     fn parse_match_specs(spec_strings: &[String]) -> Result<Vec<MatchSpec>> {
         spec_strings
             .iter()
@@ -489,7 +919,7 @@ impl RattlerBackend {
             ));
         }
 
-        let mut solver = RattlerSolver::default();
+        let mut solver = RattlerSolver;
         let solved = solver
             .solve(SolverTask {
                 specs: specs.clone(),
@@ -628,6 +1058,8 @@ impl RattlerBackend {
                 "Refusing to remove the rattler base environment".to_string(),
             ));
         }
+        let _prefix_lock = Self::acquire_prefix_lock(&prefix, LockOperation::Remove).await?;
+        StagedPrefix::recover(&prefix)?;
 
         if Self::helper_package_manager(&environment).is_some() {
             if matches!(output_mode, OutputMode::Stream | OutputMode::Summary) {
@@ -932,21 +1364,6 @@ impl RattlerBackend {
         }
     }
 
-    async fn ensure_adopted_environment(
-        &self,
-        target: &EnvironmentTarget,
-        output_mode: OutputMode,
-    ) -> Result<DiscoveredEnvironment> {
-        let environment = self.resolve_environment_target(target).await?;
-
-        if environment.rattler_managed() {
-            return Ok(environment);
-        }
-
-        self.adopt_discovered_environment(&environment, output_mode)
-            .await
-    }
-
     async fn ensure_removable_environment(
         &self,
         target: &EnvironmentTarget,
@@ -1015,6 +1432,73 @@ impl RattlerBackend {
         cache_root.join("pkgs")
     }
 
+    fn cache_lock_path(cache_root: &Path) -> PathBuf {
+        cache_root.join(".enva-cache-operation.lock")
+    }
+
+    fn cache_ownership_marker_path(cache_root: &Path) -> PathBuf {
+        cache_root.join(".enva-cache-owned.json")
+    }
+
+    fn ensure_cache_ownership_marker(cache_root: &Path) -> Result<()> {
+        fs::create_dir_all(cache_root).map_err(|error| {
+            EnvError::FileOperation(format!(
+                "Failed to create rattler cache directory {}: {}",
+                cache_root.display(),
+                error
+            ))
+        })?;
+        let marker_path = Self::cache_ownership_marker_path(cache_root);
+        if marker_path.exists() {
+            let content = fs::read_to_string(&marker_path).map_err(|error| {
+                EnvError::FileOperation(format!(
+                    "Failed to read rattler cache ownership marker {}: {}",
+                    marker_path.display(),
+                    error
+                ))
+            })?;
+            let marker: CacheOwnershipMarker = serde_json::from_str(&content).map_err(|error| {
+                EnvError::Validation(format!(
+                    "Failed to parse rattler cache ownership marker {}: {}",
+                    marker_path.display(),
+                    error
+                ))
+            })?;
+            if marker.owner != "enva" || marker.cache_root != cache_root {
+                return Err(EnvError::PermissionDenied(format!(
+                    "Rattler cache ownership marker does not authorize {}",
+                    cache_root.display()
+                )));
+            }
+            return Ok(());
+        }
+
+        let marker = CacheOwnershipMarker {
+            version: 1,
+            cache_root: cache_root.to_path_buf(),
+            owner: "enva".to_string(),
+        };
+        let serialized = serde_json::to_vec_pretty(&marker).map_err(|error| {
+            EnvError::Serialization(format!(
+                "Failed to serialize cache ownership marker: {}",
+                error
+            ))
+        })?;
+        fs::write(&marker_path, serialized).map_err(|error| {
+            EnvError::FileOperation(format!(
+                "Failed to write rattler cache ownership marker {}: {}",
+                marker_path.display(),
+                error
+            ))
+        })
+    }
+
+    async fn acquire_cache_lock(&self, operation: LockOperation) -> Result<OperationLock> {
+        let cache_root = Self::cache_root_dir()?;
+        Self::ensure_cache_ownership_marker(&cache_root)?;
+        OperationLock::acquire(Self::cache_lock_path(&cache_root), operation).await
+    }
+
     fn cache_directory_entries(cache_root: &Path) -> Vec<(&'static str, PathBuf)> {
         vec![
             ("packages", cache_root.join("pkgs")),
@@ -1078,7 +1562,7 @@ impl RattlerBackend {
             ));
         }
 
-        let mut solver = RattlerSolver::default();
+        let mut solver = RattlerSolver;
         let solved = solver
             .solve(SolverTask {
                 specs,
@@ -1110,6 +1594,7 @@ impl RattlerBackend {
             )));
         }
 
+        let _cache_lock = self.acquire_cache_lock(LockOperation::CacheUse).await?;
         let progress = if matches!(output_mode, OutputMode::Summary) {
             Some(Self::summary_spinner(format!(
                 "Resolving package install for {}...",
@@ -1162,34 +1647,36 @@ impl RattlerBackend {
         }
 
         let cache_root = Self::cache_root_dir()?;
-        let stashed_ownership_marker = Self::stash_ownership_marker(prefix)?;
+        let staged_prefix = StagedPrefix::prepare(prefix)?;
+        let staging_path = staged_prefix.path().to_path_buf();
+        let clone_result = clone_prefix_for_staging(prefix, &staging_path)?;
+        if matches!(output_mode, OutputMode::Stream) {
+            println!(
+                "Cloned {} files ({} bytes, {} hard links) into staging in {} ms",
+                clone_result.files_copied,
+                clone_result.bytes_copied,
+                clone_result.hard_links_preserved,
+                clone_result.elapsed_millis
+            );
+        }
         let install_result = Installer::new()
             .with_package_cache(PackageCache::new(Self::package_cache_dir(&cache_root)))
             .with_installed_packages(installed)
             .with_requested_specs(requested_specs)
-            .install(prefix, solved_records)
+            .install(&staging_path, solved_records)
             .await
             .map(|_| ())
             .map_err(|error| {
                 EnvError::Execution(format!(
-                    "Failed to install solved packages into {}: {}",
-                    prefix.display(),
+                    "Failed to install solved packages into staging prefix {}: {}",
+                    staging_path.display(),
                     error
                 ))
-            });
-        let restore_result = Self::restore_ownership_marker(prefix, stashed_ownership_marker);
+            })
+            .and_then(|()| relocate_cloned_prefix(&staging_path, prefix).map(|_| ()))
+            .and_then(|()| staged_prefix.commit());
 
-        let result = match (install_result, restore_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
-            (Err(install_error), Err(restore_error)) => Err(EnvError::Execution(format!(
-                "{}; additionally failed to restore enva ownership marker in {}: {}",
-                install_error,
-                prefix.display(),
-                restore_error
-            ))),
-        };
+        let result = install_result;
 
         if let Some(pb) = progress {
             match &result {
@@ -1241,8 +1728,7 @@ impl RattlerBackend {
         }
 
         let env_name = self.environment_name_for_prefix(prefix);
-        let mut cmd = AsyncCommand::new("bash");
-        cmd.arg("-lc").arg(&request.command);
+        let mut cmd = build_environment_run_command(&request.command)?;
         cmd.current_dir(&request.cwd);
         cmd.env("PATH", self.build_prefixed_path(prefix)?);
         cmd.env("CONDA_PREFIX", prefix);
@@ -1306,8 +1792,15 @@ impl EnvironmentBackend for RattlerBackend {
         BackendKind::Rattler
     }
 
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::rattler()
+    }
+
     async fn clean_package_cache(&self, dry_run: bool, output_mode: OutputMode) -> Result<()> {
         let cache_root = Self::cache_root_dir()?;
+        if !dry_run {
+            let _cache_lock = self.acquire_cache_lock(LockOperation::CacheClean).await?;
+        }
         let cache_directories = Self::cache_directory_entries(&cache_root);
 
         if dry_run {
@@ -1363,7 +1856,6 @@ impl EnvironmentBackend for RattlerBackend {
         force: bool,
         output_mode: OutputMode,
     ) -> Result<()> {
-        let _lock = self.creation_lock.lock().await;
         let progress = if matches!(output_mode, OutputMode::Summary) {
             Some(Self::summary_spinner(format!(
                 "Preparing environment {}...",
@@ -1398,6 +1890,8 @@ impl EnvironmentBackend for RattlerBackend {
             pb.set_message(format!("Resolving target prefix for {}...", env_name));
         }
         let target_prefix = self.target_prefix_for_env_name(env_name)?;
+        let _prefix_lock = Self::acquire_prefix_lock(&target_prefix, LockOperation::Create).await?;
+        StagedPrefix::recover(&target_prefix)?;
         let conflicting_environments =
             Self::prioritize_named_records(env_name, self.accessible_environment_records().await?)
                 .into_iter()
@@ -1457,37 +1951,29 @@ impl EnvironmentBackend for RattlerBackend {
         }
 
         if target_prefix.exists() {
-            if Self::is_environment_prefix(&target_prefix) {
-                if force {
-                    if let Some(pb) = &progress {
-                        pb.set_message(format!("Removing existing environment {}...", env_name));
-                    }
-                    if matches!(output_mode, OutputMode::Stream) {
-                        println!(
-                            "Removing existing rattler environment '{}' at {}",
-                            env_name,
-                            target_prefix.display()
-                        );
-                    }
-                    async_fs::remove_dir_all(&target_prefix)
-                        .await
-                        .map_err(|error| {
-                            EnvError::FileOperation(format!(
-                                "Failed to remove existing environment {}: {}",
-                                target_prefix.display(),
-                                error
-                            ))
-                        })?;
-                } else {
-                    return Err(EnvError::Execution(format!(
-                        "Environment {} already exists. Re-run with --force to replace it.",
-                        env_name
-                    )));
-                }
-            } else {
+            let metadata = fs::symlink_metadata(&target_prefix).map_err(|error| {
+                io_error(
+                    "Failed to inspect existing environment",
+                    &target_prefix,
+                    error,
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(EnvError::PermissionDenied(format!(
+                    "Refusing to replace non-directory or symlink environment target: {}",
+                    target_prefix.display()
+                )));
+            }
+            if !Self::is_environment_prefix(&target_prefix) {
                 return Err(EnvError::Execution(format!(
                     "Failed to create environment: Non-conda folder exists at prefix {}",
                     target_prefix.display()
+                )));
+            }
+            if !force {
+                return Err(EnvError::Execution(format!(
+                    "Environment {} already exists. Re-run with --force to replace it.",
+                    env_name
                 )));
             }
         }
@@ -1498,6 +1984,7 @@ impl EnvironmentBackend for RattlerBackend {
         if matches!(output_mode, OutputMode::Stream) {
             println!("Solving environment {} with rattler...", env_name);
         }
+        let _cache_lock = self.acquire_cache_lock(LockOperation::CacheUse).await?;
         let (requested_specs, solved_records) =
             self.solve_environment(yaml_file, &environment_yaml).await?;
 
@@ -1517,23 +2004,27 @@ impl EnvironmentBackend for RattlerBackend {
         }
 
         let cache_root = Self::cache_root_dir()?;
+        let staged_prefix = StagedPrefix::prepare(&target_prefix)?;
+        let staging_path = staged_prefix.path().to_path_buf();
         let install_result = Installer::new()
             .with_package_cache(PackageCache::new(Self::package_cache_dir(&cache_root)))
             .with_requested_specs(requested_specs)
-            .install(&target_prefix, solved_records)
+            .install(&staging_path, solved_records)
             .await
             .map(|_| ())
             .map_err(|error| {
                 EnvError::Execution(format!(
-                    "Failed to install solved packages into {}: {}",
-                    target_prefix.display(),
+                    "Failed to install solved packages into staging prefix {}: {}",
+                    staging_path.display(),
                     error
                 ))
-            });
+            })
+            .and_then(|()| write_rattler_ownership_record(&staging_path, None).map(|_| ()))
+            .and_then(|()| relocate_cloned_prefix(&staging_path, &target_prefix).map(|_| ()))
+            .and_then(|()| staged_prefix.commit());
 
         match install_result {
             Ok(()) => {
-                write_rattler_ownership_record(&target_prefix, None)?;
                 if let Some(pb) = progress {
                     pb.finish_and_clear();
                 }
@@ -1589,9 +2080,15 @@ impl EnvironmentBackend for RattlerBackend {
         packages: &[String],
         output_mode: OutputMode,
     ) -> Result<()> {
-        let environment = self
-            .ensure_adopted_environment(&EnvironmentTarget::Name(env_name.to_string()), output_mode)
-            .await?;
+        let mut environment = self.resolve_unique_record_by_name(env_name).await?;
+        let _prefix_lock =
+            Self::acquire_prefix_lock(&environment.prefix, LockOperation::Install).await?;
+        StagedPrefix::recover(&environment.prefix)?;
+        if !environment.rattler_managed() {
+            environment = self
+                .adopt_discovered_environment(&environment, output_mode)
+                .await?;
+        }
 
         if Self::helper_package_manager(&environment).is_none() {
             return self
@@ -1610,7 +2107,14 @@ impl EnvironmentBackend for RattlerBackend {
         target: &EnvironmentTarget,
         output_mode: OutputMode,
     ) -> Result<()> {
-        self.ensure_adopted_environment(target, output_mode).await?;
+        let environment = self.resolve_environment_target(target).await?;
+        let _prefix_lock =
+            Self::acquire_prefix_lock(&environment.prefix, LockOperation::Adopt).await?;
+        StagedPrefix::recover(&environment.prefix)?;
+        if !environment.rattler_managed() {
+            self.adopt_discovered_environment(&environment, output_mode)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1683,9 +2187,15 @@ impl EnvironmentBackend for RattlerBackend {
     }
 
     async fn run(&self, target: &EnvironmentTarget, request: &RunRequest) -> Result<()> {
-        let environment = self
-            .ensure_adopted_environment(target, OutputMode::Summary)
-            .await?;
+        let mut environment = self.resolve_environment_target(target).await?;
+        let _prefix_lock =
+            Self::acquire_prefix_lock(&environment.prefix, LockOperation::Run).await?;
+        StagedPrefix::recover(&environment.prefix)?;
+        if !environment.rattler_managed() {
+            environment = self
+                .adopt_discovered_environment(&environment, OutputMode::Summary)
+                .await?;
+        }
         self.run_command_in_prefix(&environment.prefix, request)
             .await
     }
@@ -1693,8 +2203,12 @@ impl EnvironmentBackend for RattlerBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::RattlerBackend;
-    use crate::backend::{EnvironmentBackend, EnvironmentTarget, OutputMode, RunRequest};
+    use super::{
+        benchmark_prefix_clone, clone_prefix_for_staging, relocate_cloned_prefix, RattlerBackend,
+    };
+    use crate::backend::{
+        EnvironmentBackend, EnvironmentTarget, OutputMode, RunCommand, RunRequest,
+    };
     use crate::ownership::write_rattler_ownership_record;
     use crate::package_manager::PackageManager;
     use crate::prefix_registry::{DiscoveredEnvironment, EnvironmentOwner, EnvironmentSource};
@@ -1782,7 +2296,162 @@ mod tests {
         fs::set_permissions(path, permissions).unwrap();
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn prefix_clone_preserves_internal_hard_links_without_linking_to_source() {
+        let _guard = env_lock().lock().unwrap();
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary_directory = tempdir().unwrap();
+        let source = temporary_directory.path().join("source");
+        let destination = temporary_directory.path().join("staging");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        let source_first = source.join("bin/tool");
+        let source_second = source.join("bin/tool-alias");
+        fs::write(&source_first, b"payload\n").unwrap();
+        fs::hard_link(&source_first, &source_second).unwrap();
+
+        let result = clone_prefix_for_staging(&source, &destination).unwrap();
+        let destination_first = destination.join("bin/tool");
+        let destination_second = destination.join("bin/tool-alias");
+        let source_metadata = fs::metadata(&source_first).unwrap();
+        let destination_first_metadata = fs::metadata(&destination_first).unwrap();
+        let destination_second_metadata = fs::metadata(&destination_second).unwrap();
+
+        assert_eq!(result.hard_links_preserved, 1);
+        assert_eq!(
+            destination_first_metadata.ino(),
+            destination_second_metadata.ino()
+        );
+        assert_ne!(source_metadata.ino(), destination_first_metadata.ino());
+        fs::write(&destination_first, b"staged\n").unwrap();
+        assert_eq!(fs::read(&source_first).unwrap(), b"payload\n");
+        assert_eq!(fs::read(&destination_second).unwrap(), b"staged\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prefix_clone_preserves_internal_symlinks_and_rejects_escaping_targets() {
+        let _guard = env_lock().lock().unwrap();
+        let temporary_directory = tempdir().unwrap();
+        let source = temporary_directory.path().join("source");
+        let destination = temporary_directory.path().join("staging");
+        fs::create_dir_all(source.join("lib")).unwrap();
+        fs::write(source.join("lib/library.so"), b"library").unwrap();
+        std::os::unix::fs::symlink("library.so", source.join("lib/current.so")).unwrap();
+        std::os::unix::fs::symlink(
+            source.join("lib/library.so"),
+            source.join("absolute-library.so"),
+        )
+        .unwrap();
+
+        let result = clone_prefix_for_staging(&source, &destination).unwrap();
+        assert_eq!(result.symlinks_copied, 2);
+        assert_eq!(
+            fs::read_link(destination.join("lib/current.so")).unwrap(),
+            PathBuf::from("library.so")
+        );
+        assert_eq!(
+            fs::read_link(destination.join("absolute-library.so")).unwrap(),
+            destination.join("lib/library.so")
+        );
+
+        let outside = temporary_directory.path().join("outside.txt");
+        fs::write(&outside, b"outside").unwrap();
+        let escaping_source = temporary_directory.path().join("escaping-source");
+        fs::create_dir(&escaping_source).unwrap();
+        std::os::unix::fs::symlink("../outside.txt", escaping_source.join("relative-escape"))
+            .unwrap();
+        let error = clone_prefix_for_staging(
+            &escaping_source,
+            &temporary_directory.path().join("escaping-stage"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("escaping source prefix"));
+
+        fs::remove_file(escaping_source.join("relative-escape")).unwrap();
+        std::os::unix::fs::symlink(&outside, escaping_source.join("absolute-escape")).unwrap();
+        let error = clone_prefix_for_staging(
+            &escaping_source,
+            &temporary_directory.path().join("absolute-stage"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("escaping source prefix"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn relocation_rewrites_text_and_absolute_symlinks_and_rejects_binary_residuals() {
+        let _guard = env_lock().lock().unwrap();
+        let temporary_directory = tempdir().unwrap();
+        let staging = temporary_directory.path().join("staging-prefix");
+        let final_prefix = temporary_directory
+            .path()
+            .join("final-prefix-with-longer-name");
+        fs::create_dir_all(staging.join("bin")).unwrap();
+        fs::write(
+            staging.join("bin/tool"),
+            format!(
+                "#!{}/bin/python\nprefix={}\n",
+                staging.display(),
+                staging.display()
+            ),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(staging.join("bin/tool"), staging.join("absolute-tool"))
+            .unwrap();
+
+        let result = relocate_cloned_prefix(&staging, &final_prefix).unwrap();
+        assert_eq!(result.files_rewritten, 1);
+        assert_eq!(result.symlinks_rewritten, 1);
+        let text = fs::read_to_string(staging.join("bin/tool")).unwrap();
+        assert!(!text.contains(staging.to_string_lossy().as_ref()));
+        assert!(text.contains(final_prefix.to_string_lossy().as_ref()));
+        assert_eq!(
+            fs::read_link(staging.join("absolute-tool")).unwrap(),
+            final_prefix.join("bin/tool")
+        );
+
+        let binary_staging = temporary_directory.path().join("binary-staging");
+        fs::create_dir(&binary_staging).unwrap();
+        let mut binary = vec![0_u8, 1, 2];
+        binary.extend_from_slice(binary_staging.to_string_lossy().as_bytes());
+        binary.push(0);
+        fs::write(binary_staging.join("binary"), binary).unwrap();
+        let error = relocate_cloned_prefix(&binary_staging, &final_prefix).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Binary file contains staging prefix residual"));
+    }
+
+    #[test]
+    fn large_prefix_clone_without_reflinks_completes_with_expected_accounting() {
+        let _guard = env_lock().lock().unwrap();
+        let temporary_directory = tempdir().unwrap();
+        let source = temporary_directory.path().join("large-source");
+        let destination = temporary_directory.path().join("large-stage");
+        fs::create_dir(&source).unwrap();
+        let payload = vec![b'x'; 4096];
+        for file_index in 0..2_000_u32 {
+            fs::write(source.join(format!("file-{file_index:04}.dat")), &payload).unwrap();
+        }
+
+        let result = benchmark_prefix_clone(&source, &destination).unwrap();
+        assert_eq!(result.files_copied, 2_000);
+        assert_eq!(result.bytes_copied, 2_000 * 4096);
+        assert!(
+            result.elapsed_millis < 30_000,
+            "clone took {} ms",
+            result.elapsed_millis
+        );
+        assert_eq!(
+            fs::read(destination.join("file-1999.dat")).unwrap(),
+            payload
+        );
+    }
+
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn validate_yaml_accepts_basic_environment_file() {
         let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
@@ -1803,6 +2472,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn validate_yaml_reports_missing_dependencies_section() {
         let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
@@ -1821,6 +2491,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn validate_yaml_reports_pip_subsection_as_unsupported() {
         let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
@@ -1889,6 +2560,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn find_environment_prefixes_returns_named_environment() {
         let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
@@ -1903,6 +2575,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn remove_environment_with_output_removes_named_environment() {
         let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
@@ -1920,6 +2593,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     async fn remove_environment_with_output_continues_when_marker_write_is_denied() {
         let _guard = env_lock().lock().unwrap();
@@ -2048,23 +2722,6 @@ mod tests {
                 .as_normalized(),
             "python"
         );
-    }
-
-    #[test]
-    fn ownership_marker_can_be_stashed_and_restored() {
-        let _guard = env_lock().lock().unwrap();
-        let tempdir = tempdir().unwrap();
-        let prefix = tempdir.path().join("envs").join("demo");
-        create_fake_environment(&prefix);
-        write_fake_prefix_record(&prefix, "python");
-        write_rattler_ownership_record(&prefix, Some("micromamba")).unwrap();
-
-        let stashed = RattlerBackend::stash_ownership_marker(&prefix).unwrap();
-        assert!(stashed.is_some());
-        assert!(!prefix.join("conda-meta").join("enva-rattler.json").exists());
-
-        RattlerBackend::restore_ownership_marker(&prefix, stashed).unwrap();
-        assert!(prefix.join("conda-meta").join("enva-rattler.json").exists());
     }
 
     #[test]
@@ -2217,6 +2874,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn clean_package_cache_removes_rattler_cache_directories() {
         let _guard = env_lock().lock().unwrap();
         let previous = std::env::var_os("RATTLER_CACHE_DIR");
@@ -2250,6 +2908,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn run_uses_prefix_bin_and_conda_prefix() {
         let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
@@ -2267,10 +2926,10 @@ mod tests {
             .run(
                 &EnvironmentTarget::Prefix(PathBuf::from(&env_prefix)),
                 &RunRequest {
-                    command: format!(
+                    command: RunCommand::Shell(format!(
                         "test \"$CONDA_PREFIX\" = '{}' && rattler-test-tool",
                         env_prefix.display()
-                    ),
+                    )),
                     env_vars: vec![],
                     cwd: tempdir.path().to_path_buf(),
                     capture_output: true,

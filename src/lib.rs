@@ -5,9 +5,11 @@ pub mod env;
 pub mod env_run;
 pub mod error;
 pub mod micromamba;
+mod operation_lock;
 mod ownership;
 pub mod package_manager;
 mod prefix_registry;
+mod staged_prefix;
 
 // Re-export commonly used types
 pub use backend::{BackendKind, BackendSelector, OutputMode};
@@ -29,9 +31,9 @@ pub async fn initialize() -> Result<()> {
     Ok(())
 }
 
-/// Display startup banner
+/// Display the interactive startup banner on standard error.
 pub fn display_startup_banner() {
-    println!(
+    eprintln!(
         r#"#========================================#
 #       enva v0.1.0                        #
 #  Rattler-First Env Manager               #
