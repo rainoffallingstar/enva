@@ -969,6 +969,18 @@ impl MicromambaManager {
         Ok(())
     }
 
+    fn append_run_target_arguments(
+        &self,
+        command: &mut AsyncCommand,
+        target_flag: &str,
+        target: &str,
+    ) {
+        command.arg("run").arg(target_flag).arg(target);
+        if self.pm_type.uses_run_command_separator() {
+            command.arg("--");
+        }
+    }
+
     async fn run_with_target_extended(
         &self,
         target_flag: &str,
@@ -979,7 +991,7 @@ impl MicromambaManager {
         capture_output: bool,
     ) -> Result<()> {
         let mut cmd = AsyncCommand::new(&self.pm_path);
-        cmd.arg("run").arg(target_flag).arg(target).arg("--");
+        self.append_run_target_arguments(&mut cmd, target_flag, target);
         append_environment_run_command(&mut cmd, command)?;
         cmd.current_dir(cwd);
 
@@ -1036,7 +1048,7 @@ impl MicromambaManager {
     /// Run command in environment
     pub async fn run_in_environment(&self, env_name: &str, command: &str) -> Result<Output> {
         let mut cmd = AsyncCommand::new(&self.pm_path);
-        cmd.arg("run").arg("-n").arg(env_name).arg("--");
+        self.append_run_target_arguments(&mut cmd, "-n", env_name);
         append_environment_shell_arguments(&mut cmd, command);
 
         self.apply_env_to_command(&mut cmd);
@@ -1785,6 +1797,31 @@ mod tests {
             creation_lock: Arc::new(Mutex::new(())),
             env_list_cache: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    #[test]
+    fn run_target_arguments_follow_manager_specific_separator_syntax() {
+        let temp_dir = tempdir().unwrap();
+        let mut manager = build_test_manager(temp_dir.path());
+        let mut micromamba_command = AsyncCommand::new("micromamba");
+        manager.append_run_target_arguments(&mut micromamba_command, "-n", "demo");
+        let micromamba_arguments = micromamba_command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().to_string())
+            .collect::<Vec<String>>();
+
+        manager.pm_type = PackageManager::Mamba;
+        let mut mamba_command = AsyncCommand::new("mamba");
+        manager.append_run_target_arguments(&mut mamba_command, "-n", "demo");
+        let mamba_arguments = mamba_command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().to_string())
+            .collect::<Vec<String>>();
+
+        assert_eq!(micromamba_arguments, vec!["run", "-n", "demo", "--"]);
+        assert_eq!(mamba_arguments, vec!["run", "-n", "demo"]);
     }
 
     #[test]

@@ -44,6 +44,11 @@ impl PackageManager {
         }
     }
 
+    /// Whether the manager accepts `--` between the target and executable for `run`.
+    pub fn uses_run_command_separator(&self) -> bool {
+        matches!(self, PackageManager::Conda | PackageManager::Micromamba)
+    }
+
     /// Get run command syntax: e.g., "conda run -n env"
     pub fn run_syntax(&self, env: &str) -> String {
         match self {
@@ -288,6 +293,14 @@ mod tests {
         assert_eq!(PackageManager::Mamba.command(), "mamba");
         assert_eq!(PackageManager::Micromamba.command(), "micromamba");
         assert_eq!(PackageManager::None.command(), "");
+    }
+
+    #[test]
+    fn test_run_command_separator_contract() {
+        assert!(PackageManager::Conda.uses_run_command_separator());
+        assert!(PackageManager::Micromamba.uses_run_command_separator());
+        assert!(!PackageManager::Mamba.uses_run_command_separator());
+        assert!(!PackageManager::None.uses_run_command_separator());
     }
 
     #[test]

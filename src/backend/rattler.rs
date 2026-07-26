@@ -495,6 +495,7 @@ impl RattlerBackend {
         if default_environment
             .map(|environment| environment.eq_ignore_ascii_case("base"))
             .unwrap_or(false)
+            || (prefix.join("conda-meta").is_dir() && prefix.join("envs").is_dir())
         {
             return CondaPrefixLayout::BaseRoot(prefix.to_path_buf());
         }
@@ -809,6 +810,21 @@ impl RattlerBackend {
         }
 
         channels
+    }
+
+    fn remove_ownership_marker_before_installation(staging_prefix: &Path) -> Result<()> {
+        let marker_path: PathBuf = ownership_record_path(staging_prefix);
+        if !marker_path.exists() {
+            return Ok(());
+        }
+
+        fs::remove_file(&marker_path).map_err(|error| {
+            EnvError::FileOperation(format!(
+                "Failed to remove staging ownership marker {}: {}",
+                marker_path.display(),
+                error
+            ))
+        })
     }
 
     fn collect_installed_prefix_records(prefix: &Path) -> Result<Vec<PrefixRecord>> {
@@ -1639,10 +1655,12 @@ impl RattlerBackend {
             );
         }
 
+        let ownership_record = read_ownership_record(prefix)?;
         let cache_root = Self::cache_root_dir()?;
         let staged_prefix = StagedPrefix::prepare(prefix)?;
         let staging_path = staged_prefix.path().to_path_buf();
         let clone_result = clone_prefix_for_staging(prefix, &staging_path)?;
+        Self::remove_ownership_marker_before_installation(&staging_path)?;
         if matches!(output_mode, OutputMode::Stream) {
             println!(
                 "Cloned {} files ({} bytes, {} hard links) into staging in {} ms",
@@ -1666,6 +1684,12 @@ impl RattlerBackend {
                     staging_path.display(),
                     error
                 ))
+            })
+            .and_then(|()| {
+                let adopted_from: Option<&str> = ownership_record
+                    .as_ref()
+                    .and_then(|record| record.adopted_from.as_deref());
+                write_rattler_ownership_record(&staging_path, adopted_from).map(|_| ())
             })
             .and_then(|()| {
                 validate_staged_prefix_for_publication(&staging_path, prefix).map(|_| ())
@@ -2538,6 +2562,19 @@ mod tests {
     }
 
     #[test]
+    fn base_prefix_with_conda_layout_is_detected_without_default_env() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("active-conda-root");
+        fs::create_dir_all(root.join("conda-meta")).unwrap();
+        fs::create_dir_all(root.join("envs")).unwrap();
+
+        assert_eq!(
+            RattlerBackend::classify_conda_prefix(&root, None),
+            super::CondaPrefixLayout::BaseRoot(root)
+        );
+    }
+
+    #[test]
     fn preferred_root_prefix_uses_first_existing_root() {
         let _guard = env_lock().lock().unwrap();
         let tempdir = tempdir().unwrap();
@@ -2707,6 +2744,29 @@ mod tests {
 
         assert_eq!(RattlerBackend::helper_package_manager(&environment), None);
         assert!(RattlerBackend::has_native_rattler_conflict(&environment));
+    }
+
+    #[test]
+    fn staging_install_removes_non_package_ownership_record() {
+        let tempdir = tempdir().unwrap();
+        let prefix = tempdir.path().join("staging");
+        create_fake_environment(&prefix);
+        write_fake_prefix_record(&prefix, "demo");
+        write_rattler_ownership_record(&prefix, None).unwrap();
+
+        assert!(PrefixRecord::collect_from_prefix::<PrefixRecord>(&prefix).is_err());
+        RattlerBackend::remove_ownership_marker_before_installation(&prefix).unwrap();
+        let records = PrefixRecord::collect_from_prefix::<PrefixRecord>(&prefix).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0]
+                .repodata_record
+                .package_record
+                .name
+                .as_normalized(),
+            "demo"
+        );
     }
 
     #[test]
