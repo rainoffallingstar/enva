@@ -16,7 +16,8 @@ dependencies:
   - qualimap
 
   # Methylation Analysis
-  - bismark
+  # Bismark is supplied by the checksum-pinned Rust suite declared in
+  # otter-core-bismark-rust-3.1.0-r2.yaml; do not install the legacy Perl package here.
   - trim-galore
   - samtools=1.15.1
   - hdf5
@@ -32,7 +33,6 @@ dependencies:
   # ChIP-seq/ATAC-seq Core Tools
   - macs2=2.2.7.1         # Pin to a Python 3.8-compatible build
   - bwa=0.7.17            # Alignment for ChIP-seq
-  - bowtie2=2.5.4         # Alternative alignment for ChIP-seq
-
-  # Workflow Utilities
+  # Bowtie2 is supplied by the checksum-pinned upstream Linux release asset.
+  # Do not add a Conda Bowtie2 package to this revision.
   - pyyaml
