@@ -1,0 +1,7 @@
+name: gate6-picard-java17
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - openjdk=17
+  - picard=3.4.0
