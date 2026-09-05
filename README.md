@@ -1,217 +1,94 @@
-# enva - Rattler-First Environment Manager
+# enva
 
-enva is a standalone, rattler-first environment manager for bioinformatics workflows. It creates and maintains its own environments natively, while still discovering and interoperating with existing `conda`, `mamba`, and `micromamba` environments when needed.
+**A rattler-first environment manager for reproducible bioinformatics workflows.**
 
-## Features
+enva creates and maintains native rattler environments while discovering and interoperating with existing `conda`, `mamba`, and `micromamba` environments when explicitly requested.
 
-- **Rattler-first by default**: native create, solve, install, run, and remove flows for rattler-managed environments
-- **Compatibility aware**: discovers environments from `conda`, `mamba`, and `micromamba`; canonical aliases are deduplicated, while distinct same-name prefixes require explicit `--prefix` selection
-- **Adoption support**: can adopt an existing external environment into rattler ownership metadata; rattler mutation and removal never adopt implicitly
-- **Three pre-configured environments**:
-  - `otter-core`
-  - `otter-snakemake`
-  - `otter-extra`
-- **Operational controls**: dry-run validation, JSON output, detailed environment listing, cache cleanup
+## Why enva
 
-## Installation
+- Native create, solve, install, run, validate, and remove operations through rattler.
+- Explicit adoption of external environments instead of implicit mutation.
+- Deterministic handling of duplicate names through `--prefix`.
+- JSON output, dry-run validation, detailed listings, cache cleanup, and shell integration.
+- Built-in Otter environments: `otter-core`, `otter-snakemake`, and `otter-extra`.
 
-### Download a release binary
+## Install
 
-Download the latest release asset for your platform:
-- `enva-windows-x86_64.exe`
-- `enva-linux-x86_64`
-- `enva-macos-x86_64`
-- `enva-macos-aarch64`
-
-### Build from source
+Download the release binary for your platform, or build from source:
 
 ```bash
-git clone <repository>
+git clone https://github.com/rainoffallingstar/enva.git
 cd enva
 cargo build --release
+./target/release/enva --help
 ```
 
-## Usage
+## First use
 
-### Create environments
+Create and inspect the standard runtime environments:
 
 ```bash
-# Create all built-in environments
-./enva create --all
-
-# Create selected built-in environments
-./enva create --core
-./enva create --snakemake
-./enva create --extra
-
-# Create a custom environment from YAML
-./enva create --yaml ./src/configs/otter-core.yaml --name otter-core
-
-# Replace an existing environment and clean rattler caches first
-./enva create --yaml ./src/configs/otter-core.yaml --name otter-core --force --clean-cache
-
-# Create and immediately install extra packages
-./enva create --core --with seqtk --with conda-forge::jq
-
-# Validate only
-./enva --dry-run create --all
+enva create --all
+enva list --detailed
+enva validate --all
+enva run otter-core -- fastqc --version
 ```
 
-### List environments
+Create a custom environment:
 
 ```bash
-# Merge same-name environments and show prefixes
-./enva list
-
-# Show owner / source / adopted-from columns
-./enva list --detailed
-
-# JSON output
-./enva --json list
+enva create \
+  --yaml ./src/configs/otter-core.yaml \
+  --name otter-core
 ```
 
-### Run commands
+Add packages using separate MatchSpec arguments:
 
 ```bash
-# Recommended syntax
-./enva run otter-core -- fastqc --version
-
-# Equivalent flag-based syntax
-./enva run --name otter-core --command "fastqc --version"
-
-# Explicit prefix
-./enva run --prefix /path/to/env -- fastqc --version
+enva install --name otter-core fastqc multiqc
+ enva install --name otter-core 'numpy>=1.24,<2'
 ```
 
-### Activate or deactivate a shell
+The leading space in the second example is optional; it is shown only to emphasize that the command is independent.
+
+## Shell integration
 
 ```bash
-# One-time shell integration in Bash / Zsh
- eval "$(./enva shell hook bash)"
-
-# After the hook is loaded, these behave like native shell commands
-enva activate otter-core
-enva deactivate
-
-# Direct one-shot activation still works
- eval "$(./enva activate otter-core)"
- eval "$(./enva deactivate)"
-```
-
-```fish
-# Fish hook
-./enva shell hook fish | source
-
-# After the hook is loaded
+eval "$(enva shell hook bash)"
 enva activate otter-core
 enva deactivate
 ```
 
-```powershell
-# PowerShell hook
-./enva shell hook powershell | Invoke-Expression
-
-# After the hook is loaded
-enva activate otter-core
-enva deactivate
-```
-
-### Install packages
-
-```bash
-# Install multiple packages
-./enva install --name otter-core fastqc multiqc
-
-# Version constraints containing commas remain one MatchSpec argument
-./enva install --name otter-core 'numpy>=1.24,<2'
-
-# Mixed-channel specs are accepted as separate arguments
-./enva install --name otter-core conda-forge::jq bioconda::seqtk
-```
-
-### Adopt or remove environments
-
-```bash
-# Adopt an existing environment by name or prefix
-./enva adopt --name otter-core
-./enva adopt --prefix /path/to/external/env
-
-# Remove one or more uniquely resolved rattler-owned environments
-./enva remove otter-core otter-extra
-
-# Use an explicit prefix when a name maps to multiple physical environments
-./enva remove --prefix /path/to/rattler-owned/env
-
-# External environments must be adopted explicitly before rattler removal
-./enva adopt --prefix /path/to/external/env
-./enva remove --prefix /path/to/external/env
-```
-
-### Validate configuration
-
-```bash
-./enva validate --all
-./enva validate --name otter-core
-```
+Equivalent one-shot activation is available through `eval "$(enva activate otter-core)"`. Fish and PowerShell hooks are also supported.
 
 ## Compatibility model
 
-| Operation | Rattler backend | CLI compatibility backend |
-|---|---|---|
-| Create, cache cleanup | Native | Delegated to selected package manager |
-| YAML validation | Native solve | Delegated basic validation |
-| YAML validation with additional specs | Native solve | Unsupported |
-| Install/remove by name or prefix | Native for rattler-owned prefixes; delegated for explicitly adopted prefixes | Delegated |
-| Adopt external environment | Native | Unsupported |
-| Discovery | Native registry plus compatibility discovery | Delegated |
-| Run by name or prefix | Native prefix execution after ownership checks | Delegated |
+| Operation | Native rattler | Explicit compatibility path |
+| --- | --- | --- |
+| Create and cache cleanup | Yes | Delegated when selected |
+| YAML validation | Native solve | Basic delegated validation |
+| Install/remove | Rattler-owned prefixes | Adopted/external prefixes only |
+| Discover/list/run | Native registry | conda/mamba/micromamba discovery |
+| Adopt external prefix | Yes | Unsupported |
 
-Unsupported operations fail at the command boundary. `Native`, `Delegated`, `Hybrid`, and `Unsupported` support levels are defined in `BackendCapabilities` and implemented by each backend.
+Important rules:
 
-- **Primary path**: rattler-managed environments
-- **Secondary path**: adopted or external environments discovered from `conda`, `mamba`, or `micromamba`
-- `ENVA_PACKAGE_MANAGER` is a compatibility discovery preference; direct manager construction and `--pm` selection fail closed when the requested executable is unavailable
-- `micromamba` is never downloaded or installed by `enva`; it must already be available in `PATH` or be configured with `ENVA_MICROMAMBA_PATH`
-- `ENVA_BACKEND=cli` is an expert-only compatibility mode; the normal default remains `rattler`
-- Rattler ownership metadata is stored in `conda-meta/enva-rattler.json`; when `enva` delegates install or remove operations to `micromamba`, `mamba`, or `conda`, that marker is temporarily stashed so libmamba-based tooling does not parse it as a package record
+- `ENVA_BACKEND=cli` is an expert compatibility mode; the default remains rattler-first.
+- `micromamba` is never downloaded by enva and must already be installed or configured through `ENVA_MICROMAMBA_PATH`.
+- Multiple accessible environments with the same name fail closed until `--prefix` selects one.
+- External environments must be adopted explicitly before rattler mutation or removal.
+- `pip:` subsections in environment YAML are intentionally rejected by the rattler backend.
 
-Examples:
+## Development
 
 ```bash
-# Prefer a specific compatibility package manager when listing/running in CLI mode
-ENVA_PACKAGE_MANAGER=conda ENVA_BACKEND=cli enva run otter-core -- fastqc --version
-
-# Use an explicitly installed micromamba outside PATH
-ENVA_MICROMAMBA_PATH=/opt/micromamba/bin/micromamba ENVA_PACKAGE_MANAGER=micromamba ENVA_BACKEND=cli enva list --detailed
-
-# Force explicit compatibility mode for troubleshooting
-ENVA_BACKEND=cli enva list --detailed
+cargo fmt --all -- --check
+cargo test
+cargo build --release
 ```
 
-## Testing
+The full end-to-end workflow also exercises standard environment creation, mixed-channel package installation, adopted micromamba prefixes, replacement under an active `CONDA_PREFIX`, and removal safeguards.
 
-The e2e workflow covers:
+## License
 
-- `otter-core`, `otter-snakemake`, and `otter-extra`: create, list, validate, install extra packages, run smoke commands, and remove
-- Multi-package mixed-source installs through one command, including separate specs like `conda-forge::jq bioconda::seqtk`
-- Adopted `micromamba` environments: adopt into rattler ownership, install extra packages through the compatibility layer, run commands, and remove through the helper package manager
-- Same-name replacement under an active `CONDA_PREFIX`, ensuring the active root prefix is preferred during `create --force`
-
-## Limitations
-
-- `pip:` subsections inside environment YAML files are intentionally rejected by the rattler backend
-- If multiple accessible environments share the same name, execution and mutation fail closed until an explicit `--prefix` is supplied
-- External environments must be explicitly adopted before the rattler backend can install into, run in, or remove them
-
-## Benchmarking
-
-```bash
-# Build the benchmark helper
-cargo build --bin enva-bench
-
-# Benchmark the default rattler-first run path
-cargo run --bin enva-bench -- --env-name otter-core --command "true"
-
-# Compare with an explicit compatibility package manager
-cargo run --bin enva-bench -- --env-name otter-core --pm micromamba --compare-native --format json
-```
+MIT
