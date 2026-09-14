@@ -16,9 +16,9 @@ jobs:
       matrix:
         include:
           - label: current
-          - label: no-rmats
+          - label: unpin-bwa-rmats
+          - label: unpin-bwa
           - label: no-bismark-bowtie2
-          - label: no-rmats-no-bismark
     steps:
       - name: Checkout enva
         uses: actions/checkout@v4
@@ -38,14 +38,18 @@ jobs:
           import os, pathlib, re
           variant = os.environ["PROBE_VARIANT"]
           text = pathlib.Path("src/configs/otter-core.yaml").read_text()
+          if "unpin-rmats" in variant:
+              text = text.replace("  - rmats=4.1.2\n", "  - rmats\n")
           if "no-rmats" in variant:
               text = text.replace("  - rmats=4.1.2\n", "")
+          if "unpin-bwa" in variant:
+              text = re.sub(r"(?m)^  - bwa=0\.7\.17.*$", "  - bwa", text)
           if "no-bismark" in variant:
               text = text.replace("  - bismark=3.1.0\n", "").replace("  - bowtie2=2.5.5\n", "")
           pathlib.Path("probe").mkdir(exist_ok=True)
           pathlib.Path("probe/candidate.yaml").write_text(text)
           for line in text.splitlines():
-              if re.search(r"rmats|bismark|bowtie2|python|samtools|multiqc", line):
+              if re.search(r"rmats|bismark|bowtie2|bwa|python|samtools|multiqc", line):
                   print("CONSTRAINT:", line)
           PY
 
