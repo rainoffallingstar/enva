@@ -4,7 +4,7 @@ channels:
   - bioconda
 dependencies:
   # Core Python
-  # rmats 4.1.2 requires Python >= 3.9, so the environment cannot be pinned to 3.8.
+  # rmats 4.1.2 only ships builds for Python < 3.10, so the environment cannot use 3.11.
   - python=3.10.13
   - numpy=1.24.4
   - pandas

@@ -2,6 +2,10 @@ name: Solve probe (temporary)
 
 # Temporary diagnostic: decide which otter-core dependency adjustment makes the environment
 # solvable against the current bioconda/conda-forge repodata. Not part of the release contract.
+#
+# The variant matrix used to infer mutations from substrings of the job label, which silently
+# never unpinned `rmats` for the `unpin-bwa-rmats` label. Mutations are now explicit and each
+# one must change the rendered YAML or the job fails.
 
 on:
   workflow_dispatch:
@@ -16,9 +20,17 @@ jobs:
       matrix:
         include:
           - label: current
-          - label: unpin-bwa-rmats
-          - label: unpin-bwa
+            mutations: ''
+          - label: rmats-4.4.0
+            mutations: 'rmats=4.4.0'
+          - label: rmats-unpinned
+            mutations: 'unpin-rmats'
+          - label: rmats-unpinned-bwa-unpinned
+            mutations: 'unpin-rmats,unpin-bwa'
+          - label: rmats-4.4.0-python-3.11
+            mutations: 'rmats=4.4.0,python=3.11'
           - label: no-bismark-bowtie2
+            mutations: 'drop-bismark-bowtie2'
     steps:
       - name: Checkout enva
         uses: actions/checkout@v4
@@ -31,25 +43,36 @@ jobs:
 
       - name: Materialise the candidate YAML
         env:
-          PROBE_VARIANT: ${{ matrix.label }}
+          PROBE_MUTATIONS: ${{ matrix.mutations }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import os, pathlib, re
-          variant = os.environ["PROBE_VARIANT"]
+
+          mutations = [token for token in os.environ["PROBE_MUTATIONS"].split(",") if token]
           text = pathlib.Path("src/configs/otter-core.yaml").read_text()
-          if "unpin-rmats" in variant:
-              text = text.replace("  - rmats=4.1.2\n", "  - rmats\n")
-          if "no-rmats" in variant:
-              text = text.replace("  - rmats=4.1.2\n", "")
-          if "unpin-bwa" in variant:
-              text = re.sub(r"(?m)^  - bwa=0\.7\.17.*$", "  - bwa", text)
-          if "no-bismark" in variant:
-              text = text.replace("  - bismark=3.1.0\n", "").replace("  - bowtie2=2.5.5\n", "")
+
+          for mutation in mutations:
+              before = text
+              if mutation == "unpin-rmats":
+                  text = re.sub(r"(?m)^  - rmats=.*$", "  - rmats", text)
+              elif mutation == "unpin-bwa":
+                  text = re.sub(r"(?m)^  - bwa=.*$", "  - bwa", text)
+              elif mutation == "drop-bismark-bowtie2":
+                  text = re.sub(r"(?m)^  - (bismark|bowtie2)=.*\n", "", text)
+              elif mutation.startswith("rmats="):
+                  text = re.sub(r"(?m)^  - rmats=.*$", f"  - rmats={mutation.split('=', 1)[1]}", text)
+              elif mutation.startswith("python="):
+                  text = re.sub(r"(?m)^  - python=.*$", f"  - python={mutation.split('=', 1)[1]}", text)
+              else:
+                  raise SystemExit(f"unknown mutation: {mutation}")
+              if text == before:
+                  raise SystemExit(f"mutation had no effect: {mutation}")
+
           pathlib.Path("probe").mkdir(exist_ok=True)
           pathlib.Path("probe/candidate.yaml").write_text(text)
           for line in text.splitlines():
-              if re.search(r"rmats|bismark|bowtie2|bwa|python|samtools|multiqc", line):
+              if re.search(r"rmats|bismark|bowtie2|bwa|python|samtools", line):
                   print("CONSTRAINT:", line)
           PY
 
@@ -71,67 +94,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: solve-probe-${{ matrix.label }}
-          path: ci-logs/
-          if-no-files-found: warn
-          retention-days: 3
-
-  cli-backend-probe:
-    name: CLI backend ${{ matrix.manager }} on otter-core
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        manager: [micromamba, mamba]
-    env:
-      ENVA_BACKEND: cli
-      ENVA_PACKAGE_MANAGER: ${{ matrix.manager }}
-      RUST_BACKTRACE: 1
-    steps:
-      - name: Checkout enva
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up micromamba
-        if: matrix.manager == 'micromamba'
-        uses: mamba-org/setup-micromamba@v2
-        with:
-          generate-run-shell: false
-
-      - name: Set up mamba
-        if: matrix.manager == 'mamba'
-        uses: conda-incubator/setup-miniconda@v3
-        with:
-          miniforge-version: latest
-          mamba-version: "*"
-          channels: conda-forge
-          activate-environment: ""
-          auto-activate-base: false
-
-      - name: Build enva
-        run: cargo build --release --bin enva
-
-      - name: Create otter-core through the external solver
-        shell: bash -el {0}
-        run: |
-          set -euo pipefail
-          mkdir -p ci-logs
-          "${{ matrix.manager }}" --version | tee "ci-logs/${{ matrix.manager }}-version.log"
-          ./target/release/enva create \
-            --yaml src/configs/otter-core.yaml \
-            --name "probe-cli-${{ matrix.manager }}" \
-            --force \
-            --output summary \
-            2>&1 | tee "ci-logs/cli-${{ matrix.manager }}-otter-core.log"
-          echo "CLI_PROBE_SOLVED ${{ matrix.manager }}"
-
-      - name: Upload CLI probe log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cli-probe-${{ matrix.manager }}
           path: ci-logs/
           if-no-files-found: warn
           retention-days: 3
