@@ -1630,7 +1630,8 @@ dependencies:
   - seqkit
   - seqtk
   - qualimap
-  - bismark
+  - bismark=3.1.0
+  - bowtie2=2.5.5
   - trim-galore
   - samtools=1.15.1
   - hdf5
@@ -1640,7 +1641,6 @@ dependencies:
   - picard
   - macs2=2.2.7.1
   - bwa=0.7.17
-  - bowtie2=2.5.4
   - pyyaml
 "#
         .to_string()
