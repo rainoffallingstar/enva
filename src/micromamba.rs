@@ -1635,10 +1635,10 @@ dependencies:
   - hdf5
   - star
   - htseq=2.0.3
-  - rmats=4.1.2
+  - rmats=4.4.0
   - picard
   - macs2
-  - bwa=0.7.17
+  - bwa=0.7.19
   - pyyaml
 "#
         .to_string()
