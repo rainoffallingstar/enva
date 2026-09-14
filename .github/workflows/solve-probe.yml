@@ -21,16 +21,10 @@ jobs:
         include:
           - label: current
             mutations: ''
-          - label: rmats-4.4.0
-            mutations: 'rmats=4.4.0'
-          - label: rmats-unpinned
-            mutations: 'unpin-rmats'
           - label: rmats-unpinned-bwa-unpinned
             mutations: 'unpin-rmats,unpin-bwa'
-          - label: rmats-4.4.0-python-3.11
-            mutations: 'rmats=4.4.0,python=3.11'
-          - label: no-bismark-bowtie2
-            mutations: 'drop-bismark-bowtie2'
+          - label: rmats-unpinned-bwa-unpinned-python-3.11
+            mutations: 'unpin-rmats,unpin-bwa,python=3.11'
     steps:
       - name: Checkout enva
         uses: actions/checkout@v4
@@ -88,6 +82,32 @@ jobs:
             --output summary \
             2>&1 | tee "ci-logs/probe-${{ matrix.label }}.log"
           echo "PROBE_SOLVED ${{ matrix.label }}"
+
+      - name: Report the resolved versions
+        if: success()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "ci-logs/resolved-versions.log"
+          import json, pathlib
+
+          environment_name = "probe-${{ matrix.label }}"
+          prefix = pathlib.Path.home() / ".local/share/rattler/envs" / environment_name
+          tracked = {
+              "python", "rmats", "bwa", "samtools", "bismark", "bowtie2",
+              "libzlib", "zlib", "star", "htseq", "picard", "macs2", "fastqc",
+          }
+          resolved = {}
+          for record_path in sorted(prefix.glob("conda-meta/*.json")):
+              record = json.loads(record_path.read_text())
+              resolved[record.get("name", "")] = (record.get("version", ""), record.get("build", ""))
+          for package_name in sorted(tracked):
+              if package_name in resolved:
+                  version, build = resolved[package_name]
+                  print(f"{package_name}={version} ({build})")
+          missing = sorted(tracked - set(resolved))
+          if missing:
+              print(f"not installed: {', '.join(missing)}")
+          PY
 
       - name: Upload probe log
         if: always()
