@@ -19,12 +19,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `current` is now the committed otter-core, so this variant validates the
+          # rmats/bwa repin directly.
           - label: current
             mutations: ''
-          - label: rmats-unpinned-bwa-unpinned
-            mutations: 'unpin-rmats,unpin-bwa'
-          - label: rmats-unpinned-bwa-unpinned-python-3.11
-            mutations: 'unpin-rmats,unpin-bwa,python=3.11'
     steps:
       - name: Checkout enva
         uses: actions/checkout@v4
