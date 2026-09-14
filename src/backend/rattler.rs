@@ -517,28 +517,44 @@ impl RattlerBackend {
     }
 
     fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
-        if path.is_absolute() {
-            fs::canonicalize(path).or_else(|error| {
-                let parent = path.parent().ok_or_else(|| {
-                    EnvError::FileOperation(format!("Path has no parent: {}", path.display()))
-                })?;
-                let canonical_parent = fs::canonicalize(parent).map_err(|parent_error| {
-                    EnvError::FileOperation(format!(
-                        "Failed to canonicalize {}: {}; original error: {}",
-                        parent.display(),
-                        parent_error,
-                        error
-                    ))
-                })?;
-                Ok(canonical_parent.join(path.file_name().ok_or_else(|| {
-                    EnvError::Validation(format!("Path has no file name: {}", path.display()))
-                })?))
-            })
-        } else {
-            Err(EnvError::Validation(format!(
+        if !path.is_absolute() {
+            return Err(EnvError::Validation(format!(
                 "Environment paths must be absolute: {}",
                 path.display()
-            )))
+            )));
+        }
+        if let Ok(canonical) = fs::canonicalize(path) {
+            return Ok(canonical);
+        }
+        // The target may not exist yet (for example `~/.local/share/rattler` on a fresh
+        // machine). Walk up to the nearest existing ancestor, canonicalize that, and
+        // re-append the missing components so the caller can create them.
+        let mut missing_components = Vec::new();
+        let mut ancestor = path;
+        loop {
+            match ancestor.parent() {
+                Some(parent) => {
+                    if let Some(name) = ancestor.file_name() {
+                        missing_components.push(name.to_os_string());
+                    }
+                    match fs::canonicalize(parent) {
+                        Ok(canonical_parent) => {
+                            let mut resolved = canonical_parent;
+                            for component in missing_components.iter().rev() {
+                                resolved.push(component);
+                            }
+                            return Ok(resolved);
+                        }
+                        Err(_) => ancestor = parent,
+                    }
+                }
+                None => {
+                    return Err(EnvError::FileOperation(format!(
+                        "Cannot resolve an existing ancestor for {}",
+                        path.display()
+                    )));
+                }
+            }
         }
     }
 
@@ -2234,6 +2250,7 @@ mod tests {
         EnvironmentBackend, EnvironmentTarget, OutputMode, RunCommand, RunRequest,
     };
     use crate::ownership::write_rattler_ownership_record;
+    use crate::error::EnvError;
     use crate::package_manager::PackageManager;
     use crate::prefix_registry::{DiscoveredEnvironment, EnvironmentOwner, EnvironmentSource};
     use rattler_conda_types::{PackageName, PackageRecord, PrefixRecord, RepoDataRecord, Version};
@@ -2601,6 +2618,28 @@ mod tests {
 
         let target_prefix = backend.target_prefix_for_env_name("test-env").unwrap();
         assert_eq!(target_prefix, root.join("envs").join("test-env"));
+    }
+
+    #[test]
+    fn canonical_or_absolute_resolves_missing_parent_directories() {
+        let tempdir = tempdir().unwrap();
+        let existing = tempdir.path().join("existing");
+        fs::create_dir_all(&existing).unwrap();
+        // A fresh machine may not have `~/.local/share` at all, so resolving a root
+        // prefix below several missing directories must still succeed.
+        let missing = existing.join("a").join("b").join("c");
+
+        let resolved = RattlerBackend::canonical_or_absolute(&missing).unwrap();
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&existing).unwrap().join("a").join("b").join("c")
+        );
+    }
+
+    #[test]
+    fn canonical_or_absolute_rejects_relative_paths() {
+        let error = RattlerBackend::canonical_or_absolute(Path::new("relative/root")).unwrap_err();
+        assert!(matches!(error, EnvError::Validation(_)), "{error:?}");
     }
 
     #[tokio::test]
