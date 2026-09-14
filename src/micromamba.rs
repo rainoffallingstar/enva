@@ -1622,7 +1622,7 @@ channels:
   - conda-forge
   - bioconda
 dependencies:
-  - python=3.8.18
+  - python=3.10.13
   - numpy=1.24.4
   - pandas
   - fastqc
@@ -1639,7 +1639,7 @@ dependencies:
   - htseq=2.0.3
   - rmats=4.1.2
   - picard
-  - macs2=2.2.7.1
+  - macs2
   - bwa=0.7.17
   - pyyaml
 "#
