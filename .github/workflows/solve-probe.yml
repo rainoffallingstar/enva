@@ -1,0 +1,74 @@
+name: Solve probe (temporary)
+
+# Temporary diagnostic: decide which otter-core dependency adjustment makes the environment
+# solvable against the current bioconda/conda-forge repodata. Not part of the release contract.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: rmats-unpinned
+          - label: no-bismark-bowtie2
+          - label: rmats-unpinned-no-bismark
+          - label: original-python38
+    steps:
+      - name: Checkout enva
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build enva
+        run: cargo build --release --bin enva
+
+      - name: Materialise the candidate YAML
+        env:
+          PROBE_VARIANT: ${{ matrix.label }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re
+          variant = os.environ["PROBE_VARIANT"]
+          text = pathlib.Path("src/configs/otter-core.yaml").read_text()
+          if "rmats-unpinned" in variant:
+              text = text.replace("  - rmats=4.1.2\n", "  - rmats\n")
+          if "no-bismark" in variant:
+              text = text.replace("  - bismark=3.1.0\n", "").replace("  - bowtie2=2.5.5\n", "")
+          if variant == "original-python38":
+              text = text.replace("  - python=3.10.13\n", "  - python=3.8.18\n")
+          pathlib.Path("probe").mkdir(exist_ok=True)
+          pathlib.Path("probe/candidate.yaml").write_text(text)
+          for line in text.splitlines():
+              if re.search(r"rmats|bismark|bowtie2|python|samtools", line):
+                  print("CONSTRAINT:", line)
+          PY
+
+      - name: Attempt a real solve and install
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          mkdir -p "$RATTLER_CACHE_DIR" ci-logs
+          ./target/release/enva create \
+            --yaml probe/candidate.yaml \
+            --name "probe-${{ matrix.label }}" \
+            --force \
+            --output summary \
+            2>&1 | tee "ci-logs/probe-${{ matrix.label }}.log"
+          echo "PROBE_SOLVED ${{ matrix.label }}"
+
+      - name: Upload probe log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solve-probe-${{ matrix.label }}
+          path: ci-logs/
+          if-no-files-found: warn
+          retention-days: 3
