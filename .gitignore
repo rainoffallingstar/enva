@@ -34,6 +34,8 @@ dist/
 
 # Test outputs
 test-yaml/
+ci-artifacts/
+ci-logs/
 
 # Environment variables
 .env

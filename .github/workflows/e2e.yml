@@ -42,7 +42,6 @@ jobs:
             install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
     env:
       CARGO_TERM_COLOR: always
-      ENVA_PACKAGE_MANAGER: micromamba
       RUST_BACKTRACE: 1
     steps:
       - name: Checkout code
@@ -50,11 +49,6 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up micromamba
-        uses: mamba-org/setup-micromamba@v2
-        with:
-          generate-run-shell: false
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -149,6 +143,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # This job intentionally installs external conda/mamba/micromamba to exercise enva's
+  # advertised compatibility backend (ENVA_BACKEND=cli). It is an enva feature test, not
+  # a scientific analysis pipeline; OTTER scientific workflows use enva only.
   compatibility-backend-smoke:
     name: Compatibility smoke (${{ matrix.manager }})
     runs-on: ubuntu-latest
@@ -246,6 +243,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # This job intentionally installs external micromamba to create a foreign prefix and
+  # exercise enva's advertised `adopt` capability. It is an enva feature test, not a
+  # scientific analysis pipeline; OTTER scientific workflows use enva only.
   adopt-e2e:
     name: E2E adopt-helper-path
     runs-on: ubuntu-latest
