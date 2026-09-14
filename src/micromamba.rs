@@ -123,7 +123,6 @@ fn resolve_micromamba_path(
 pub const TOOL_ENVIRONMENT_MAP: &[(&str, &str)] = &[
     // QC Tools -> otter-core
     ("fastqc", CORE_ENV_NAME),
-    ("multiqc", CORE_ENV_NAME),
     ("seqkit", CORE_ENV_NAME),
     ("seqtk", CORE_ENV_NAME),
     ("samtools", CORE_ENV_NAME),
@@ -1626,7 +1625,6 @@ dependencies:
   - numpy=1.24.4
   - pandas
   - fastqc
-  - multiqc=1.19
   - seqkit
   - seqtk
   - qualimap

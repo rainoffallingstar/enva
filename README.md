@@ -45,7 +45,7 @@ enva create \
 Add packages using separate MatchSpec arguments:
 
 ```bash
-enva install --name otter-core fastqc multiqc
+enva install --name otter-core fastqc seqkit
  enva install --name otter-core 'numpy>=1.24,<2'
 ```
 

@@ -112,7 +112,7 @@ The heart of the application - handles all micromamba operations:
 - `TOOL_ENVIRONMENT_MAP` - Maps tools to their default environments
 
 **3 Pre-configured Environments:**
-1. `otter-core` - Core bioinformatics tools (FastQC, MultiQC, Bismark, STAR, BWA, Qualimap, etc.)
+1. `otter-core` - Core bioinformatics tools (FastQC, Bismark, STAR, BWA, Qualimap, etc.)
 2. `otter-snakemake` - Workflow engine and dependencies
 3. `otter-extra` - Advanced visualization and analysis tools
 
@@ -174,7 +174,7 @@ CLI Args → main.rs → env.rs → micromamba.rs → MicromambaManager
    - Uses micromamba run command
 
 3. **Install Packages:**
-   - User runs `enva install --name otter-core --packages "fastqc,multiqc"`
+   - User runs `enva install --name otter-core --packages "fastqc,seqkit"`
    - Installs packages into specified environment
 
 ## Key Dependencies
