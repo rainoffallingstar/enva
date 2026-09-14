@@ -1633,7 +1633,7 @@ dependencies:
   - bismark=3.1.0
   - bowtie2=2.5.5
   - trim-galore
-  - samtools=1.15.1
+  - samtools>=1.15
   - hdf5
   - star
   - htseq=2.0.3
