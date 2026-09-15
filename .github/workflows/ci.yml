@@ -63,3 +63,19 @@ jobs:
           path: ci-artifacts/
           if-no-files-found: warn
           retention-days: 90
+
+      - name: Job summary
+        if: always()
+        continue-on-error: true
+        run: |
+          bash scripts/ci/job-summary.sh \
+            --verdict "${{ job.status }}" \
+            --title "enva — quality gate" \
+            --checked "Formatting, Clippy with warnings denied, the full test suite, a release build, and a smoke check of the CLI surface." \
+            --check "cargo fmt --check|no diffs|cargo fmt --check|see step log" \
+            --check "cargo clippy -D warnings|no warnings|see step log|-" \
+            --check "Test suite|all tests pass|see step log|-" \
+            --check "Release build|binary builds|see step log|-" \
+            --check "CLI surface|--version, --help, list --help respond|see step log|-" \
+            --artifact "enva-quality-evidence" \
+            --limit "Static quality gate. Real package-manager interaction and per-environment solvability are covered by the E2E matrix, not here."
