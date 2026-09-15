@@ -159,6 +159,7 @@ jobs:
             --check "Smoke command inside environment|declared probe responds|see step log|${gate_result}" \
             --check "Removal|enva remove succeeds|see step log|${gate_result}" \
             --metric "Environment definition|${{ matrix.yaml }}" \
+            --limit "These rows are pass/fail gates with no numeric comparison, so the Result column carries the job verdict and the Observed column points at the step log." \
             --artifact "enva-e2e-${{ matrix.label }}-logs" \
             --limit "Lifecycle coverage for this one environment definition. It asserts that the pinned YAML solves and installs; it does not measure scientific correctness of the tools inside." \
             --note "This is the job that catches an unsolvable environment definition, which a structural dry run cannot detect."
@@ -277,6 +278,7 @@ jobs:
             --check "Create, list, install, run, remove|all operations succeed|see step log|${gate_result}" \
             --check "Removal is complete|environment absent afterwards|see step log|${gate_result}" \
             --metric "Backend|ENVA_BACKEND=cli with ENVA_PACKAGE_MANAGER=${{ matrix.manager }}" \
+            --limit "These rows are pass/fail gates with no numeric comparison, so the Result column carries the job verdict and the Observed column points at the step log." \
             --artifact "enva-compat-${{ matrix.manager }}-logs" \
             --limit "A compatibility-path feature test that deliberately uses an external manager. OTTER scientific workflows use the bundled path, so this job is not evidence about the scientific environments themselves." \
             --note "This job exists so the historical compatibility layer cannot silently rot while the bundled backend is the primary path."
@@ -421,6 +423,7 @@ jobs:
             --check "Lifecycle on adopted prefix|list, validate, install, run succeed|see step log|${gate_result}" \
             --check "Removal via helper manager|environment removed|see step log|${gate_result}" \
             --metric "Helper manager|micromamba" \
+            --limit "These rows are pass/fail gates with no numeric comparison, so the Result column carries the job verdict and the Observed column points at the step log." \
             --artifact "enva-e2e-adopt-logs" \
             --limit "Adoption is a compatibility capability for pre-existing prefixes. It does not assert that arbitrary foreign environments are reproducible from their own history." \
             --note "This is the path a user hits when migrating an existing conda installation, so it is tested rather than assumed."
@@ -524,6 +527,7 @@ jobs:
             --check "Active root wins for a same-name environment|enva resolves to the active root|see step log|${gate_result}" \
             --check "Replacement is deterministic|no cross-root ambiguity|see step log|${gate_result}" \
             --metric "Precedence rule|active conda root over other roots" \
+            --limit "These rows are pass/fail gates with no numeric comparison, so the Result column carries the job verdict and the Observed column points at the step log." \
             --artifact "enva-e2e-root-priority-logs" \
             --limit "A path-resolution invariant for a specific conflict case. It is not a general claim about every multi-root configuration a user might have." \
             --note "This guards against the most dangerous class of environment bug: acting on the wrong prefix when two installs share a name."
