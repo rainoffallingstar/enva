@@ -2090,6 +2090,15 @@ impl EnvironmentBackend for RattlerBackend {
         let syntax_valid = issues.is_empty();
         let estimated_packages = environment_yaml.dependencies.len();
 
+        // `environment_issues` only inspects the YAML structure: it checks that a
+        // dependencies section and explicit channels exist, and rejects pip subsections.
+        // It never contacts a channel or runs the solver, so what this dry run reports as
+        // "resolvable" is structural validity, not a solved dependency graph. Print the
+        // issues so the caller sees why the environment was judged invalid; the field names
+        // keep their historical meaning for JSON consumers.
+        for issue in &issues {
+            eprintln!("warning: dry-run validation issue: {issue}");
+        }
         Ok(ValidationResult {
             dry_run: true,
             environment: environment_yaml
