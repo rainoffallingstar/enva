@@ -177,12 +177,27 @@ rendered="$(render)"
 
 # The docs cap one step summary at 1 MiB and fail the upload beyond it. Truncate deterministically
 # so an oversized briefing degrades visibly instead of disappearing.
-maximum_bytes=$((1024 * 1024))
-rendered_bytes="$(printf '%s' "${rendered}" | wc -c | tr -d ' ')"
-if (( rendered_bytes > maximum_bytes )); then
-  rendered="$(printf '%s' "${rendered}" | head -c "${maximum_bytes}")
+#
+# Two details matter. The notice is appended after the cut, so the cut must reserve room for it or
+# the result would exceed the very cap being enforced. And the cut must not be done by piping into
+# `head -c`: head exits early, the writer takes SIGPIPE, and under `pipefail` the whole helper would
+# die with no output at all. Writing to a scratch file and cutting at a line boundary avoids both.
+truncation_notice="
 
 > Truncated: this briefing exceeded the 1 MiB per-step summary limit."
+maximum_bytes=$((1024 * 1024))
+notice_bytes="$(printf '%s' "${truncation_notice}" | wc -c | tr -d ' ')"
+rendered_bytes="$(printf '%s' "${rendered}" | wc -c | tr -d ' ')"
+if (( rendered_bytes > maximum_bytes )); then
+  scratch_file="$(mktemp)"
+  trap 'rm -f "${scratch_file}"' EXIT
+  printf '%s' "${rendered}" >"${scratch_file}"
+  rendered="$(awk -v limit="$((maximum_bytes - notice_bytes))" '
+    BEGIN { total = 0 }
+    { if (total + length($0) + 1 > limit) { exit } ; print ; total += length($0) + 1 }
+  ' "${scratch_file}")${truncation_notice}"
+  rm -f "${scratch_file}"
+  trap - EXIT
 fi
 
 if [[ "${print_to_stdout}" == true || -z "${summary_file}" ]]; then
