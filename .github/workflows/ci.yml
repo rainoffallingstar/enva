@@ -68,14 +68,17 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          # Every check below is a boolean gate with no numeric comparison, so the Result column
+          # carries the job verdict: green means all preceding steps passed.
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
           bash scripts/ci/job-summary.sh \
             --verdict "${{ job.status }}" \
             --title "enva — quality gate" \
             --checked "Formatting, Clippy with warnings denied, the full test suite, a release build, and a smoke check of the CLI surface." \
-            --check "cargo fmt --check|no diffs|cargo fmt --check|see step log" \
-            --check "cargo clippy -D warnings|no warnings|see step log|-" \
-            --check "Test suite|all tests pass|see step log|-" \
-            --check "Release build|binary builds|see step log|-" \
-            --check "CLI surface|--version, --help, list --help respond|see step log|-" \
+            --check "cargo fmt --check|no diffs|cargo fmt --check|${gate_result}" \
+            --check "cargo clippy -D warnings|no warnings|see step log|${gate_result}" \
+            --check "Test suite|all tests pass|see step log|${gate_result}" \
+            --check "Release build|binary builds|see step log|${gate_result}" \
+            --check "CLI surface|--version, --help, list --help respond|see step log|${gate_result}" \
             --artifact "enva-quality-evidence" \
             --limit "Static quality gate. Real package-manager interaction and per-environment solvability are covered by the E2E matrix, not here."

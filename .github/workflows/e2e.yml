@@ -147,16 +147,17 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
           bash scripts/ci/job-summary.sh \
             --verdict "${{ job.status }}" \
             --title "enva — end-to-end environment lifecycle" \
             --scope "${{ matrix.label }}" \
             --checked "Creates the shipped environment definition from its committed YAML, verifies discovery and registration, installs extra packages from two channels, runs a smoke command, verifies the installed packages, then removes the environment." \
-            --check "Environment created from committed YAML|create succeeds|see step log|-" \
-            --check "Discovery and registration|enva lists and validates the environment|see step log|-" \
-            --check "Mixed-source install|conda-forge and bioconda specs install|see step log|-" \
-            --check "Smoke command inside environment|declared probe responds|see step log|-" \
-            --check "Removal|enva remove succeeds|see step log|-" \
+            --check "Environment created from committed YAML|create succeeds|see step log|${gate_result}" \
+            --check "Discovery and registration|enva lists and validates the environment|see step log|${gate_result}" \
+            --check "Mixed-source install|conda-forge and bioconda specs install|see step log|${gate_result}" \
+            --check "Smoke command inside environment|declared probe responds|see step log|${gate_result}" \
+            --check "Removal|enva remove succeeds|see step log|${gate_result}" \
             --metric "Environment definition|${{ matrix.yaml }}" \
             --artifact "enva-e2e-${{ matrix.label }}-logs" \
             --limit "Lifecycle coverage for this one environment definition. It asserts that the pinned YAML solves and installs; it does not measure scientific correctness of the tools inside." \
@@ -266,14 +267,15 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
           bash scripts/ci/job-summary.sh \
             --verdict "${{ job.status }}" \
             --title "enva — compatibility backend smoke" \
             --scope "${{ matrix.manager }}" \
             --checked "Drives enva through an external package manager instead of the bundled rattler path (ENVA_BACKEND=cli): creates an environment, lists it, installs a package, runs a command inside it, and removes it." \
-            --check "External manager detected|enva selects ${{ matrix.manager }}|see step log|-" \
-            --check "Create, list, install, run, remove|all operations succeed|see step log|-" \
-            --check "Removal is complete|environment absent afterwards|see step log|-" \
+            --check "External manager detected|enva selects ${{ matrix.manager }}|see step log|${gate_result}" \
+            --check "Create, list, install, run, remove|all operations succeed|see step log|${gate_result}" \
+            --check "Removal is complete|environment absent afterwards|see step log|${gate_result}" \
             --metric "Backend|ENVA_BACKEND=cli with ENVA_PACKAGE_MANAGER=${{ matrix.manager }}" \
             --artifact "enva-compat-${{ matrix.manager }}-logs" \
             --limit "A compatibility-path feature test that deliberately uses an external manager. OTTER scientific workflows use the bundled path, so this job is not evidence about the scientific environments themselves." \
@@ -408,15 +410,16 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
           bash scripts/ci/job-summary.sh \
             --verdict "${{ job.status }}" \
             --title "enva — adopt foreign environment" \
             --scope "micromamba-created prefix" \
             --checked "Creates an environment outside enva with micromamba, then adopts it through enva and exercises the full lifecycle on the adopted prefix: discovery, validation, mixed-source install, smoke command, and removal through the helper manager." \
-            --check "Foreign environment created externally|micromamba reports it|see step log|-" \
-            --check "Adoption|enva recognizes and adopts the prefix|see step log|-" \
-            --check "Lifecycle on adopted prefix|list, validate, install, run succeed|see step log|-" \
-            --check "Removal via helper manager|environment removed|see step log|-" \
+            --check "Foreign environment created externally|micromamba reports it|see step log|${gate_result}" \
+            --check "Adoption|enva recognizes and adopts the prefix|see step log|${gate_result}" \
+            --check "Lifecycle on adopted prefix|list, validate, install, run succeed|see step log|${gate_result}" \
+            --check "Removal via helper manager|environment removed|see step log|${gate_result}" \
             --metric "Helper manager|micromamba" \
             --artifact "enva-e2e-adopt-logs" \
             --limit "Adoption is a compatibility capability for pre-existing prefixes. It does not assert that arbitrary foreign environments are reproducible from their own history." \
@@ -512,13 +515,14 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
           bash scripts/ci/job-summary.sh \
             --verdict "${{ job.status }}" \
             --title "enva — active root precedence" \
             --scope "same-name replacement" \
             --checked "Creates an environment under the active conda root and asserts that the active root wins when the same environment name exists elsewhere, so enva never silently operates on a different prefix than the user's active one." \
-            --check "Active root wins for a same-name environment|enva resolves to the active root|see step log|-" \
-            --check "Replacement is deterministic|no cross-root ambiguity|see step log|-" \
+            --check "Active root wins for a same-name environment|enva resolves to the active root|see step log|${gate_result}" \
+            --check "Replacement is deterministic|no cross-root ambiguity|see step log|${gate_result}" \
             --metric "Precedence rule|active conda root over other roots" \
             --artifact "enva-e2e-root-priority-logs" \
             --limit "A path-resolution invariant for a specific conflict case. It is not a general claim about every multi-root configuration a user might have." \
